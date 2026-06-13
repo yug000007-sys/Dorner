@@ -11,6 +11,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from docx import Document
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -186,13 +187,37 @@ def extract_quote_total_lead_time(text: str):
 
 
 def extract_device(text: str):
+    """
+    Device column rule:
+    keep the full Dorner lead detail from the first Distributor line through
+    all quote/product/general notes/spare-parts sections. Do NOT stop at
+    Grand Total, because some leads include Additional Spare Parts after the
+    quote total. Only remove the Dorner footer and Created line when present.
+    """
     if not text:
         return ""
+
     start = re.search(r"^Distributor\s*:", text, flags=re.I | re.M)
-    end_matches = list(re.finditer(r"Grand Total\s*:\s*\$?\s*[\d,]+\.\d{2}", text, flags=re.I))
     start_idx = start.start() if start else 0
-    end_idx = end_matches[-1].end() if end_matches else len(text)
-    return normalize_text(text[start_idx:end_idx])
+
+    tail = text[start_idx:]
+    end_candidates = []
+    for pattern in [
+        r"^\s*©\s*\d{4}\s+Dorner\s+Mfg\.\s+Corp\.",
+        r"^\s*Created\s*:",
+        r"^\s*USA\s*:\s*800\.397\.8664",
+    ]:
+        m = re.search(pattern, tail, flags=re.I | re.M)
+        if m:
+            end_candidates.append(m.start())
+
+    end_idx = start_idx + min(end_candidates) if end_candidates else len(text)
+    device = normalize_text(text[start_idx:end_idx]).strip()
+
+    # Excel supports a maximum of 32,767 characters in one cell. Keep the full
+    # device content whenever possible; if a very rare lead exceeds Excel's
+    # hard limit, keep the maximum Excel can store rather than failing.
+    return device[:32767]
 
 
 def apply_brand_product_rules(device_text: str):
@@ -297,11 +322,27 @@ def append_records_to_workbook(records):
     ws = wb.active
     headers = [ws.cell(1, col).value for col in range(1, ws.max_column + 1)]
     header_to_col = {str(h).strip(): i + 1 for i, h in enumerate(headers) if h}
+
+    device_col = header_to_col.get("device") or header_to_col.get("Device")
+
     for record in records:
         row = ws.max_row + 1
         for excel_header, record_key in HEADER_MAP.items():
             if excel_header in header_to_col:
-                ws.cell(row=row, column=header_to_col[excel_header]).value = record.get(record_key, "")
+                cell = ws.cell(row=row, column=header_to_col[excel_header])
+                cell.value = record.get(record_key, "")
+                if excel_header.lower() == "device":
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+        if device_col:
+            ws.row_dimensions[row].height = 120
+
+    if device_col:
+        # Make the long device text visible/readable in Excel. This does not
+        # truncate content; users can expand the row height or read formula bar.
+        col_letter = ws.cell(row=1, column=device_col).column_letter
+        ws.column_dimensions[col_letter].width = 80
+        ws.cell(row=1, column=device_col).alignment = Alignment(wrap_text=True, vertical="top")
+
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
