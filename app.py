@@ -102,13 +102,18 @@ def read_uploaded_file(uploaded_file):
 
 
 def value_after(label: str, text: str, stop_labels=None):
+    """Extract value for a label only when the label begins a line.
+    This prevents matching the greeting line "Dorner Distributor," as Distributor.
+    """
     stop_labels = stop_labels or []
-    pattern = rf"{re.escape(label)}\s*:?\s*(.*?)"
+    label_pat = re.escape(label)
+    pattern = rf"^\s*{label_pat}\s*:?\s*(.*?)"
     if stop_labels:
-        pattern += rf"(?=\n(?:{'|'.join(map(re.escape, stop_labels))})\s*:|$)"
+        stops = "|".join(map(re.escape, stop_labels))
+        pattern += rf"(?=\n\s*(?:{stops})\s*:|$)"
     else:
         pattern += r"(?:\n|$)"
-    m = re.search(pattern, text, flags=re.I | re.S)
+    m = re.search(pattern, text, flags=re.I | re.S | re.M)
     return normalize_text(m.group(1)) if m else ""
 
 
@@ -423,7 +428,7 @@ def generate_docx(lead):
     add_color_bar(doc)
     add_info_table(doc, [
         ("Customer Contact Info:", ""),
-        ("Name:", f"{lead.get('FirstName','')} {lead.get('LastName','')}").strip(),
+        ("Name:", f"{lead.get('FirstName','')} {lead.get('LastName','')}".strip()),
         ("Title:", lead.get("ContactTitle", "")),
         ("Industry:", lead.get("Industry", "")),
         ("Company:", lead.get("Company", "")),
