@@ -1,27 +1,46 @@
 # Dorner Lead Automation
 
-Clean Streamlit app for Dorner lead processing.
+Flat Streamlit project for Dorner lead processing.
 
-## Files
-- `app.py` - Streamlit app and all processing logic
-- `requirements.txt` - Python dependencies
-- `template.xlsx` - Excel output header template
-- `README.md` - this guide
+## What it does
 
-## DOCX fix in this version
-The generated DOCX now matches the user's sample style:
-- starts directly with `Dorner Distributor,`
-- no `DORNER LEAD DOCUMENT` heading
-- no file-name block
-- no subject block
-- no visible URL/mailto/tracking lines
-- keeps the full original Dorner email body including quote details, general notes, spare parts, footer, and Created line
+- Upload `.msg` or `.txt` Dorner lead
+- Extract customer, quote, product and device details
+- Apply Dorner rules:
+  - AquaGard/AquaPruf -> Brand `Dorner`, Product `AquaX`
+  - Garvey -> Brand `Garvey`, Product blank
+  - Montratec -> Brand `Montratec`, Product blank
+  - LeadSource1 -> `Request For Quote`
+  - Keyword -> subject line
+  - LeadComments -> CAD or Config comment
+- Creates files named like `Dorner_YYYYMMDD_HHMMSS`
+  - `.docx`
+  - `.pdf`
+  - `.msg`
+- Creates Excel output with the `PDF` column containing all three filenames
+- Device column keeps full long section, including spare parts and Created line
 
 ## Run locally
+
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Streamlit Cloud
-Upload all four files to the root of your GitHub repository, then deploy `app.py`.
+## Deploy to Streamlit Cloud
+
+Upload these files to GitHub root:
+
+- `app.py`
+- `requirements.txt`
+- `README.md`
+
+Then set Streamlit Cloud main file path to:
+
+```text
+app.py
+```
+
+## Important
+
+The DOCX and PDF are template-style outputs with orange bars, blue info sections and formatted product tables, not plain text dumps.

@@ -1,151 +1,133 @@
 import io
-import os
 import re
 import zipfile
-import tempfile
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-from html import escape
+from datetime import datetime
+from pathlib import Path
 
+import pandas as pd
 import streamlit as st
-from bs4 import BeautifulSoup
 from docx import Document
-from docx.shared import Pt
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+from docx.shared import Inches, Pt, RGBColor
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+
+try:
+    import extract_msg
+except Exception:
+    extract_msg = None
 
 APP_TITLE = "Dorner Lead Automation"
-TEMPLATE_FILE = "template.xlsx"
-DEFAULT_SUBJECT = "URGENT DORNER LEAD - Quote EQUIPMENT"
+ORANGE = "FF6600"
+BLUE = "C6D9F1"
+DARK_BLUE = "004C83"
 
-CONFIG_COMMENT = (
-    "Please find the following new RFQ and URGENT lead from Dorner Config and process accordingly. "
-    "Kindly contact the customer to review the application to ensure the proper equipment is quoted based upon "
-    "the application requirements. Please click on 'Click Here' below to view the lead details."
-)
+EXCEL_COLUMNS = [
+    "Brand", "ReceivedDateTime", "FirstName", "LastName", "ContactTitle", "Email",
+    "Company", "Address", "City", "State", "ZipCode", "Country", "LeadSource1",
+    "LeadComments", "PhoneSupplied", "PhoneResearched", "PDF", "Keyword", "device",
+]
+
 CAD_COMMENT = (
     "Please find the following new RFQ and URGENT lead from Dorner CAD and process accordingly. "
-    "Kindly contact the customer to review the application to ensure the proper equipment is quoted based upon "
-    "the application requirements. Please click on 'Click Here' below to view the lead details."
+    "Kindly contact the customer to review the application to ensure the proper equipment is quoted "
+    "based upon the application requirements. Please click on 'Click Here' below to view the lead details."
 )
-
-HEADER_MAP = {
-    "Brand": "Brand",
-    "ReceivedDateTime": "ReceivedDateTime",
-    "FirstName": "FirstName",
-    "LastName": "LastName",
-    "ContactTitle": "ContactTitle",
-    "Email": "Email",
-    "Company": "Company",
-    "Address": "Address",
-    "City": "City",
-    "State": "State",
-    "ZipCode": "ZipCode",
-    "Country": "Country",
-    "LeadSource1": "LeadSource1",
-    "LeadComments": "LeadComments",
-    "PhoneSupplied": "PhoneSupplied",
-    "PhoneResearched": "PhoneResearched",
-    "PDF": "PDF",
-    "Product": "Product",
-    "Keyword": "Keyword",
-    "device": "device",
-}
+CONFIG_COMMENT = (
+    "Please find the following new RFQ and URGENT lead from Dorner Config and process accordingly. "
+    "Kindly contact the customer to review the application to ensure the proper equipment is quoted "
+    "based upon the application requirements. Please click on 'Click Here' below to view the lead details."
+)
 
 
 def normalize_text(text: str) -> str:
     if not text:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[\t\u00a0]+", " ", text)
-    text = re.sub(r" *\n *", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.replace("\xa0", " ").replace("\u200b", "")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
     return text.strip()
 
 
-def html_to_text(html: str) -> str:
-    if not html:
-        return ""
-    soup = BeautifulSoup(html, "lxml")
-    return normalize_text(soup.get_text("\n"))
+def remove_urls(text: str) -> str:
+    text = re.sub(r"<mailto:([^>]+)>", "", text, flags=re.I)
+    text = re.sub(r"<https?://[^>]+>", "", text, flags=re.I)
+    text = re.sub(r"https?://\S+", "", text, flags=re.I)
+    text = re.sub(r"www\.\S+", "", text, flags=re.I)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return normalize_text(text)
 
 
-def parse_msg_bytes(msg_bytes: bytes, original_name: str):
-    """Return subject, body_text, created_dt. Uses extract_msg with a temp file."""
-    try:
-        import extract_msg
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".msg") as tmp:
-            tmp.write(msg_bytes)
-            tmp_path = tmp.name
-        try:
-            msg = extract_msg.Message(tmp_path)
-            subject = (getattr(msg, "subject", None) or original_name or DEFAULT_SUBJECT).strip()
-            body = getattr(msg, "body", None) or ""
-            if not body and getattr(msg, "htmlBody", None):
-                html_body = msg.htmlBody
-                if isinstance(html_body, bytes):
-                    html_body = html_body.decode("utf-8", errors="ignore")
-                body = html_to_text(html_body)
-            date_value = getattr(msg, "date", None) or getattr(msg, "delivery_time", None)
-            created_dt = parse_any_datetime(str(date_value)) if date_value else None
-            try:
-                msg.close()
-            except Exception:
-                pass
-            return subject, normalize_text(body), created_dt, None
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-    except Exception as exc:
-        return original_name or DEFAULT_SUBJECT, "", None, str(exc)
+def read_uploaded_file(uploaded_file):
+    raw = uploaded_file.read()
+    name = uploaded_file.name
+    subject = ""
+    created = ""
+    body = ""
+
+    if name.lower().endswith(".msg") and extract_msg:
+        temp_path = Path("/tmp") / name
+        temp_path.write_bytes(raw)
+        msg = extract_msg.Message(str(temp_path))
+        subject = msg.subject or ""
+        created = str(msg.date or "")
+        body = msg.body or ""
+    else:
+        body = raw.decode("utf-8", errors="ignore")
+        m = re.search(r"^Subject:\s*(.+)$", body, flags=re.I | re.M)
+        if m:
+            subject = m.group(1).strip()
+        m = re.search(r"Created:\s*(.+)$", body, flags=re.I | re.M)
+        if m:
+            created = m.group(1).strip()
+
+    body = normalize_text(body)
+    if not created:
+        m = re.search(r"Created:\s*(.+)$", body, flags=re.I | re.M)
+        created = m.group(1).strip() if m else ""
+    if not subject:
+        q = re.search(r"Dorner Quote:\s*([\w-]+)", body, re.I)
+        subject = f"URGENT DORNER LEAD - Quote EQUIPMENT {q.group(1)}" if q else Path(name).stem
+    return raw, subject, created, body
 
 
-def parse_any_datetime(value: str):
-    if not value:
-        return None
-    value = value.strip()
-    patterns = [
-        "%a %d %b %Y %I:%M:%S %p %Z",
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%d %b %Y %H:%M:%S %z",
-        "%Y-%m-%d %H:%M:%S%z",
-        "%Y-%m-%d %H:%M:%S",
-    ]
-    cleaned = value.replace(" UTC", " +0000")
-    for fmt in patterns:
-        try:
-            return datetime.strptime(cleaned, fmt)
-        except Exception:
-            pass
-    try:
-        return parsedate_to_datetime(value)
-    except Exception:
-        return None
+def value_after(label: str, text: str, stop_labels=None):
+    stop_labels = stop_labels or []
+    pattern = rf"{re.escape(label)}\s*:?\s*(.*?)"
+    if stop_labels:
+        pattern += rf"(?=\n(?:{'|'.join(map(re.escape, stop_labels))})\s*:|$)"
+    else:
+        pattern += r"(?:\n|$)"
+    m = re.search(pattern, text, flags=re.I | re.S)
+    return normalize_text(m.group(1)) if m else ""
 
 
-def extract_created_date(text: str, fallback=None):
-    m = re.search(r"Created:\s*(.+)", text or "", flags=re.I)
-    if m:
-        dt = parse_any_datetime(m.group(1).strip())
-        if dt:
-            return dt
-    return fallback or datetime.now(timezone.utc)
+def parse_address(text: str):
+    m = re.search(r"Address:\s*(.*?)(?=\n\s*\n|\n\s*Dorner Quote:|\n\s*CAD Models|$)", text, flags=re.I | re.S)
+    address_block = normalize_text(m.group(1)) if m else ""
+    lines = [x.strip() for x in address_block.splitlines() if x.strip()]
+    street = lines[0] if lines else ""
+    city = state = zip_code = country = ""
+    if len(lines) >= 2:
+        last = lines[-1]
+        mm = re.search(r"(.+?)\s+([A-Z]{2})\s+([A-Z0-9 -]{3,10})\s+([A-Z]{2})$", last.strip())
+        if mm:
+            city, state, zip_code, country = [g.strip() for g in mm.groups()]
+    return address_block, street, city, state, zip_code, country
 
 
-def field_after_label(text: str, label: str):
-    pattern = rf"^{re.escape(label)}\s*:\s*(.+)$"
-    m = re.search(pattern, text or "", flags=re.I | re.M)
-    return m.group(1).strip() if m else ""
-
-
-def parse_name(full_name: str):
-    parts = [p for p in re.split(r"\s+", (full_name or "").strip()) if p]
+def split_name(full_name: str):
+    parts = full_name.split()
     if not parts:
         return "", ""
     if len(parts) == 1:
@@ -153,129 +135,103 @@ def parse_name(full_name: str):
     return parts[0], " ".join(parts[1:])
 
 
-def parse_address(text: str):
-    m = re.search(r"^Address\s*:\s*(.+?)(?:\n\s*\n|\n\s*Dorner Quote:|\Z)", text or "", flags=re.I | re.M | re.S)
-    block = normalize_text(m.group(1)) if m else ""
-    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-    address = ""
-    city = state = zipcode = country = ""
-    if lines:
-        last = lines[-1]
-        cm = re.search(r"(.+?)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s+([A-Z]{2,3}|USA|US)$", last)
-        if cm:
-            city, state, zipcode, country = cm.group(1).strip(), cm.group(2), cm.group(3), cm.group(4)
-            address = ", ".join(lines[:-1]).strip()
-        else:
-            address = ", ".join(lines).strip()
-    if country.upper() == "US":
-        country = "USA"
-    return address, city, state, zipcode, country
+def parse_created_dt(created: str):
+    candidates = [
+        "%a %d %b %Y %I:%M:%S %p %Z",
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%d %b %Y %H:%M:%S",
+    ]
+    cleaned = created.replace("UTC", "UTC").strip()
+    for fmt in candidates:
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except Exception:
+            pass
+    m = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\s+(20\d{2})\s+(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)?", cleaned)
+    if m:
+        date_part = " ".join(m.groups(default="")[:3])
+    return datetime.utcnow()
 
 
-def extract_quote_total_lead_time(text: str):
-    quote = field_after_label(text, "Dorner Quote")
-    if quote:
-        quote = re.split(r"\s+Grand Total", quote, flags=re.I)[0].strip()
-    total = ""
-    mt = re.search(r"Grand Total\s*:\s*\$?\s*([\d,]+\.\d{2})", text or "", flags=re.I)
-    if mt:
-        total = "$" + mt.group(1)
-    lead = ""
-    ml = re.search(r"Lead Time \(Business Days\)\s*(\d+)", text or "", flags=re.I)
-    if ml:
-        lead = ml.group(1)
-    return quote, total, lead
+def build_file_base(created: str):
+    dt = parse_created_dt(created)
+    return f"Dorner_{dt.strftime('%Y%m%d_%H%M%S')}"
 
 
-def extract_device(text: str):
-    """
-    Device column rule:
-    keep the full Dorner lead detail from the first Distributor line through
-    all quote/product/general notes/spare-parts sections. Do NOT stop at
-    Grand Total, because some leads include Additional Spare Parts after the
-    quote total. Only remove the Dorner footer and Created line when present.
-    """
-    if not text:
-        return ""
-
-    start = re.search(r"^Distributor\s*:", text, flags=re.I | re.M)
-    start_idx = start.start() if start else 0
-
-    tail = text[start_idx:]
-    end_candidates = []
-    for pattern in [
-        r"^\s*©\s*\d{4}\s+Dorner\s+Mfg\.\s+Corp\.",
-        r"^\s*Created\s*:",
-        r"^\s*USA\s*:\s*800\.397\.8664",
-    ]:
-        m = re.search(pattern, tail, flags=re.I | re.M)
-        if m:
-            end_candidates.append(m.start())
-
-    end_idx = start_idx + min(end_candidates) if end_candidates else len(text)
-    device = normalize_text(text[start_idx:end_idx]).strip()
-
-    # Excel supports a maximum of 32,767 characters in one cell. Keep the full
-    # device content whenever possible; if a very rare lead exceeds Excel's
-    # hard limit, keep the maximum Excel can store rather than failing.
-    return device[:32767]
+def extract_device_text(body: str):
+    clean = remove_urls(body)
+    start = clean.lower().find("distributor:")
+    if start < 0:
+        start = 0
+    end = len(clean)
+    # keep Created line, remove only tracking/url noise after it
+    created_match = re.search(r"Created:\s*.+", clean, flags=re.I)
+    if created_match and created_match.start() > start:
+        end = created_match.end()
+    return normalize_text(clean[start:end])
 
 
-def apply_brand_product_rules(device_text: str):
-    lower = (device_text or "").lower()
-    if "garvey" in lower:
+def detect_brand_product(text: str):
+    low = text.lower()
+    if "garvey" in low:
         return "Garvey", ""
-    if "montratec" in lower:
+    if "montratec" in low:
         return "Montratec", ""
-    if "aquagard" in lower or "aquapruf" in lower:
+    if "aquagard" in low or "aquapruf" in low:
         return "Dorner", "AquaX"
     return "Dorner", ""
 
 
-def build_lead_record(subject: str, body_text: str, created_dt: datetime, base_filename: str):
-    text = normalize_text(body_text)
-    created_dt = extract_created_date(text, created_dt)
-    device = extract_device(text)
-    brand, product = apply_brand_product_rules(device)
-    full_name = field_after_label(text, "Name")
-    first_name, last_name = parse_name(full_name)
-    address, city, state, zipcode, country = parse_address(text)
-    quote, total, lead_time = extract_quote_total_lead_time(text)
-
-    if re.search(r"Dorner\s+CAD", text, flags=re.I):
-        lead_comment = CAD_COMMENT
-    else:
-        lead_comment = CONFIG_COMMENT
-
-    pdf_col = f"{base_filename}.pdf, {base_filename}.msg, {base_filename}.docx"
-    phone = field_after_label(text, "Phone")
+def parse_lead(subject: str, created: str, body: str):
+    text = remove_urls(body)
+    device = extract_device_text(body)
+    brand, product = detect_brand_product(device)
+    full_name = value_after("Name", text, ["Title", "Industry", "Company", "Phone", "Email", "Address"])
+    first, last = split_name(full_name)
+    title = value_after("Title", text, ["Industry", "Company", "Phone", "Email", "Address"])
+    industry = value_after("Industry", text, ["Company", "Phone", "Email", "Address"])
+    company = value_after("Company", text, ["Phone", "Email", "Address"])
+    phone = value_after("Phone", text, ["Email", "Address"])
+    email = value_after("Email", text, ["Address"])
+    distributor = value_after("Distributor", text, ["Customer Contact Info", "Name"])
+    address_block, street, city, state, zip_code, country = parse_address(text)
+    quote = re.search(r"Dorner Quote:\s*([\w-]+)", text, re.I)
+    total = re.search(r"Grand Total:\s*\$?([\d,]+\.\d{2})", text, re.I)
+    lead_time = re.search(r"Lead Time\s*\(Business Days\)\s*(\d+)", text, re.I)
+    is_cad = "dorner cad" in text.lower()
+    lead_comment = CAD_COMMENT if is_cad else CONFIG_COMMENT
+    base = build_file_base(created)
+    files_cell = f"{base}.pdf, {base}.msg, {base}.docx"
 
     return {
         "Brand": brand,
         "Product": product,
-        "ReceivedDateTime": created_dt.replace(tzinfo=None) if created_dt else None,
-        "FirstName": first_name,
-        "LastName": last_name,
-        "ContactTitle": field_after_label(text, "Title"),
-        "Email": field_after_label(text, "Email"),
-        "Company": field_after_label(text, "Company"),
-        "Address": address,
+        "ReceivedDateTime": created,
+        "FirstName": first,
+        "LastName": last,
+        "ContactTitle": title,
+        "Industry": industry,
+        "Email": email,
+        "Company": company,
+        "Address": street,
+        "FullAddress": address_block,
         "City": city,
         "State": state,
-        "ZipCode": zipcode,
-        "Country": country or "USA",
+        "ZipCode": zip_code,
+        "Country": "USA" if country in ["US", "USA"] else country,
         "LeadSource1": "Request For Quote",
         "LeadComments": lead_comment,
         "PhoneSupplied": phone,
         "PhoneResearched": format_phone(phone),
-        "PDF": pdf_col,
-        "Keyword": subject.strip() if subject else DEFAULT_SUBJECT,
+        "PDF": files_cell,
+        "Keyword": subject,
         "device": device,
-        "DornerQuote": quote,
-        "GrandTotal": total,
-        "LeadTimeBusinessDays": lead_time,
-        "Industry": field_after_label(text, "Industry"),
-        "Distributor": field_after_label(text, "Distributor"),
+        "Distributor": distributor,
+        "Quote": quote.group(1) if quote else "",
+        "GrandTotal": f"${total.group(1)}" if total else "",
+        "LeadTime": lead_time.group(1) if lead_time else "",
+        "FileBase": base,
+        "CleanBody": text,
     }
 
 
@@ -283,287 +239,368 @@ def format_phone(phone: str):
     digits = re.sub(r"\D", "", phone or "")
     if len(digits) == 10:
         return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
-    return phone or ""
+    return phone
 
 
-def filename_from_dt(dt: datetime):
-    if not dt:
-        dt = datetime.now(timezone.utc)
-    return "Dorner_" + dt.strftime("%Y%m%d_%H%M%S")
+def set_cell_shading(cell, fill):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:fill"), fill)
+    tc_pr.append(shd)
 
 
-def safe_para(text: str):
-    return escape(text or "").replace("\n", "<br/>")
+def set_cell_width(cell, width_inches):
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcW = OxmlElement("w:tcW")
+    tcW.set(qn("w:w"), str(int(width_inches * 1440)))
+    tcW.set(qn("w:type"), "dxa")
+    tcPr.append(tcW)
 
 
-def make_pdf_bytes(title: str, body_text: str):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=0.5*inch, leftMargin=0.5*inch, topMargin=0.5*inch, bottomMargin=0.5*inch)
-    styles = getSampleStyleSheet()
-    story = [Paragraph(escape(title), styles["Title"]), Spacer(1, 0.15*inch)]
-    for chunk in normalize_text(body_text).split("\n"):
-        story.append(Paragraph(escape(chunk) if chunk else " ", styles["BodyText"]))
-        story.append(Spacer(1, 0.04*inch))
-    doc.build(story)
-    return buffer.getvalue()
+def style_run(run, bold=False, size=10, color=None, italic=False):
+    run.bold = bold
+    run.italic = italic
+    run.font.size = Pt(size)
+    run.font.name = "Arial"
+    if color:
+        run.font.color.rgb = RGBColor.from_string(color)
 
 
-def clean_text_for_doc(text: str) -> str:
-    """Return a Word-friendly plain Dorner email body.
-
-    This is intentionally NOT a report/summary. The DOCX must look like the
-    user's sample Word file: it starts directly with "Dorner Distributor," and
-    contains the original email body as clean plain text. It removes only noisy
-    HTML/link artifacts that appear in converted MSG files.
-    """
-    text = normalize_text(text)
-
-    # Remove Outlook/HTML link targets while keeping the visible label text.
-    # Examples removed: <mailto:...>, <http://...>, <https://...>
-    text = re.sub(r"\s*<mailto:[^>]+>", "", text, flags=re.I)
-    text = re.sub(r"\s*<https?://[^>]+>", "", text, flags=re.I)
-
-    # Remove raw URLs or wrapped tracking URLs on their own lines.
-    cleaned = []
-    skip_url_block = False
-    for raw in text.split("\n"):
-        line = raw.rstrip()
-        stripped = line.strip()
-
-        if skip_url_block:
-            if stripped.endswith(">") or stripped == "":
-                skip_url_block = False
-            continue
-
-        if re.match(r"^<?https?://", stripped, flags=re.I):
-            if stripped.startswith("<") and not stripped.endswith(">"):
-                skip_url_block = True
-            continue
-
-        # Drop SendGrid/open tracking fragments that may be wrapped without a scheme.
-        if re.search(r"ct\.sendgrid\.net|/wf/open|upn=|u001\.", stripped, flags=re.I):
-            skip_url_block = True
-            continue
-
-        cleaned.append(line)
-
-    text = "\n".join(cleaned)
-
-    # Remove automation-added headings from older outputs if a generated doc is
-    # ever reprocessed. This prevents "DORNER LEAD DOCUMENT", File Name, Subject
-    # from appearing in the final DOCX.
-    lines = text.split("\n")
-    while lines and lines[0].strip() in {"DORNER LEAD DOCUMENT", ""}:
-        lines.pop(0)
-    while lines and re.match(r"^(File Name|Subject)\s*:", lines[0].strip(), flags=re.I):
-        lines.pop(0)
-    text = "\n".join(lines)
-
-    # Start exactly at Dorner Distributor when present, so no MSG header or app
-    # title appears above the lead body.
-    m = re.search(r"Dorner\s+Distributor\s*,", text, flags=re.I)
-    if m:
-        text = text[m.start():]
-
-    # Plain Word-friendly spacing.
-    text = text.replace("\u00a0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r" *\n *", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+def add_text_paragraph(doc, text, bold=False, italic=False, size=10, space_after=6):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(space_after)
+    p.paragraph_format.line_spacing = 1.15
+    r = p.add_run(text)
+    style_run(r, bold=bold, italic=italic, size=size)
+    return p
 
 
-def make_docx_bytes(title: str, body_text: str, base_name: str = ""):
-    """Create the DOCX like the user's sample Word document.
+def add_color_bar(doc, width_cols=1):
+    table = doc.add_table(rows=1, cols=width_cols)
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    for cell in table.rows[0].cells:
+        set_cell_shading(cell, ORANGE)
+        cell.height = Inches(0.28)
+        cell.text = ""
+    return table
 
-    Required output style:
-    - No title page
-    - No "DORNER LEAD DOCUMENT"
-    - No File Name / Subject block
-    - No visible URL/link target lines
-    - Starts directly with "Dorner Distributor,"
-    - Full email body remains, including quote, notes, spare parts, footer and Created line
-    """
-    document = Document()
 
-    section = document.sections[0]
-    section.top_margin = 720000      # about 0.79 in, close and compact
-    section.bottom_margin = 720000
-    section.left_margin = 720000
-    section.right_margin = 720000
+def add_info_table(doc, rows, widths=(1.2, 4.2)):
+    table = doc.add_table(rows=0, cols=2)
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    table.style = "Table Grid"
+    for label, value in rows:
+        cells = table.add_row().cells
+        for cell in cells:
+            set_cell_shading(cell, BLUE)
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        set_cell_width(cells[0], widths[0])
+        set_cell_width(cells[1], widths[1])
+        p0 = cells[0].paragraphs[0]
+        p0.paragraph_format.space_after = Pt(0)
+        r0 = p0.add_run(label)
+        style_run(r0, bold=True, size=9)
+        p1 = cells[1].paragraphs[0]
+        p1.paragraph_format.space_after = Pt(0)
+        r1 = p1.add_run(value or "")
+        style_run(r1, size=9)
+    return table
 
-    normal_style = document.styles["Normal"]
-    normal_style.font.name = "Calibri"
-    normal_style.font.size = Pt(11)
-    normal_style.paragraph_format.space_before = Pt(0)
-    normal_style.paragraph_format.space_after = Pt(0)
-    normal_style.paragraph_format.line_spacing = 1.0
 
-    doc_text = clean_text_for_doc(body_text)
-
-    # Add each original line as a paragraph. This matches the sample better than
-    # a single huge paragraph and keeps the document readable/searchable.
-    for raw_line in doc_text.split("\n"):
-        line = raw_line.rstrip()
-        p = document.add_paragraph()
-        p.paragraph_format.space_before = Pt(0)
+def add_quote_table(doc, lead):
+    add_color_bar(doc, 1)
+    table = doc.add_table(rows=1, cols=4)
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    table.style = "Table Grid"
+    widths = [1.4, 2.1, 1.4, 1.3]
+    vals = ["Dorner Quote:", lead.get("Quote", ""), "Grand Total:", lead.get("GrandTotal", "")]
+    for i, cell in enumerate(table.rows[0].cells):
+        set_cell_shading(cell, BLUE)
+        set_cell_width(cell, widths[i])
+        p = cell.paragraphs[0]
         p.paragraph_format.space_after = Pt(0)
-        p.paragraph_format.line_spacing = 1.0
-        run = p.add_run(line if line else " ")
-        run.font.name = "Calibri"
-        run.font.size = Pt(11)
+        r = p.add_run(vals[i])
+        style_run(r, bold=(i in [0,2,3]), size=9)
+        if i == 3:
+            r.underline = True
+    return table
+
+
+def parse_product_rows(clean_body: str):
+    lines = [x.strip() for x in clean_body.splitlines() if x.strip()]
+    rows = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\d+)\s+([A-Z0-9-]+)\s+(\$[\d,]+\.\d{2}\s*ea\.)", line)
+        if m:
+            qty, part, price = m.groups()
+            desc_parts = []
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if re.match(r"^\d+\s+[A-Z0-9-]+\s+\$", nxt) or nxt.startswith("Total Equipment Price") or nxt.startswith("Lead Time"):
+                    break
+                if not re.match(r"^\$[\d,]+\.\d{2}", nxt):
+                    desc_parts.append(nxt)
+                j += 1
+            rows.append([qty, part, " ".join(desc_parts), price])
+    return rows
+
+
+def add_product_section_docx(doc, lead):
+    body = lead["CleanBody"]
+    # title between grand total and Qty, if present
+    m = re.search(r"Grand Total:\s*\$?[\d,]+\.\d{2}\s*(.*?)\s*Qty\s+Part Number", body, flags=re.I | re.S)
+    title_block = normalize_text(m.group(1)) if m else ""
+    for line in title_block.splitlines():
+        if line.strip():
+            add_text_paragraph(doc, line.strip(), bold=True, size=10, space_after=3)
+
+    table = doc.add_table(rows=1, cols=4)
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    headers = ["Qty", "Part Number / Description", "Description", "Unit Price"]
+    widths = [0.45, 1.9, 4.0, 1.0]
+    for idx, cell in enumerate(table.rows[0].cells):
+        set_cell_width(cell, widths[idx])
+        p = cell.paragraphs[0]
+        r = p.add_run(headers[idx])
+        style_run(r, bold=True, size=8)
+    product_rows = parse_product_rows(body)
+    for qty, part, desc, price in product_rows:
+        cells = table.add_row().cells
+        vals = [qty, part, desc, price]
+        for idx, cell in enumerate(cells):
+            set_cell_width(cell, widths[idx])
+            p = cell.paragraphs[0]
+            p.paragraph_format.space_after = Pt(0)
+            r = p.add_run(vals[idx])
+            style_run(r, size=8)
+    if not product_rows:
+        add_text_paragraph(doc, lead["device"], size=8)
+
+
+def add_notes_docx(doc, lead):
+    body = lead["CleanBody"]
+    m = re.search(r"Total Equipment Price:\s*(\$[\d,]+\.\d{2})", body, re.I)
+    if m:
+        add_text_paragraph(doc, f"Total Equipment Price: {m.group(1)}", bold=True, size=9)
+    if lead.get("LeadTime"):
+        add_text_paragraph(doc, f"Lead Time (Business Days) {lead['LeadTime']}", bold=True, size=9)
+
+    notes_start = re.search(r"General Notes", body, re.I)
+    if notes_start:
+        notes = body[notes_start.start():]
+        # keep from General Notes through Created, no URLs
+        add_text_paragraph(doc, notes, size=8)
+
+
+def generate_docx(lead):
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Inches(0.45)
+    section.bottom_margin = Inches(0.45)
+    section.left_margin = Inches(0.45)
+    section.right_margin = Inches(0.45)
+
+    for txt in [
+        "Dorner Distributor,",
+        "Please find the following new RFQ and URGENT lead from Dorner CAD and process accordingly." if "Dorner CAD" in lead["CleanBody"] else "Please find the following new RFQ and URGENT lead from Dorner Config and process accordingly.",
+    ]:
+        add_text_paragraph(doc, txt, size=10)
+    add_text_paragraph(doc, "The pricing information has been submitted to the customer.", bold=True, italic=True, size=10)
+    add_text_paragraph(doc, "Please contact the customer to review the application to ensure the proper equipment is quoted based upon the application requirements.", bold=True, italic=True, size=10)
+    add_text_paragraph(doc, "If you have any questions, please let us know.", size=10)
+    add_text_paragraph(doc, "Best Regards,", size=10)
+    add_text_paragraph(doc, "Dorner Mfg. Corp.", size=10)
+    add_text_paragraph(doc, "CustomerService@Dorner.com", size=10)
+    add_text_paragraph(doc, "Tel: USA 800.397.8664   Global 262.367.7600", size=10)
+
+    doc.add_paragraph()
+    add_color_bar(doc)
+    add_info_table(doc, [("Distributor:", lead.get("Distributor", ""))])
+    doc.add_paragraph()
+    add_color_bar(doc)
+    add_info_table(doc, [
+        ("Customer Contact Info:", ""),
+        ("Name:", f"{lead.get('FirstName','')} {lead.get('LastName','')}").strip(),
+        ("Title:", lead.get("ContactTitle", "")),
+        ("Industry:", lead.get("Industry", "")),
+        ("Company:", lead.get("Company", "")),
+        ("Phone:", lead.get("PhoneSupplied", "")),
+        ("Email:", lead.get("Email", "")),
+    ])
+    doc.add_paragraph()
+    add_color_bar(doc)
+    add_info_table(doc, [
+        ("Customer Contact Info:", ""),
+        ("Address:", lead.get("FullAddress", "")),
+    ])
+    doc.add_paragraph()
+    add_quote_table(doc, lead)
+    add_product_section_docx(doc, lead)
+    add_notes_docx(doc, lead)
 
     out = io.BytesIO()
-    document.save(out)
+    doc.save(out)
     out.seek(0)
     return out.getvalue()
 
-def append_records_to_workbook(records):
-    if os.path.exists(TEMPLATE_FILE):
-        wb = load_workbook(TEMPLATE_FILE)
-    else:
-        raise FileNotFoundError(f"{TEMPLATE_FILE} not found. Keep it beside app.py.")
-    ws = wb.active
-    headers = [ws.cell(1, col).value for col in range(1, ws.max_column + 1)]
-    header_to_col = {str(h).strip(): i + 1 for i, h in enumerate(headers) if h}
 
-    device_col = header_to_col.get("device") or header_to_col.get("Device")
+def para_style(styles, name="normal", size=9, leading=12, bold=False, italic=False):
+    return ParagraphStyle(
+        name, parent=styles["Normal"], fontName="Helvetica-Bold" if bold else "Helvetica",
+        fontSize=size, leading=leading, textColor=colors.black, spaceAfter=4
+    )
 
-    for record in records:
-        row = ws.max_row + 1
-        for excel_header, record_key in HEADER_MAP.items():
-            if excel_header in header_to_col:
-                cell = ws.cell(row=row, column=header_to_col[excel_header])
-                cell.value = record.get(record_key, "")
-                if excel_header.lower() == "device":
-                    cell.alignment = Alignment(wrap_text=True, vertical="top")
-        if device_col:
-            ws.row_dimensions[row].height = 120
 
-    if device_col:
-        # Make the long device text visible/readable in Excel. This does not
-        # truncate content; users can expand the row height or read formula bar.
-        col_letter = ws.cell(row=1, column=device_col).column_letter
-        ws.column_dimensions[col_letter].width = 80
-        ws.cell(row=1, column=device_col).alignment = Alignment(wrap_text=True, vertical="top")
+def add_rl_table(story, data, col_widths, bg=colors.HexColor("#C6D9F1")):
+    table = Table(data, colWidths=col_widths, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), bg),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.HexColor("#D9D9D9")),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.HexColor("#D9D9D9")),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 8),
+        ("LEFTPADDING", (0,0), (-1,-1), 5),
+        ("RIGHTPADDING", (0,0), (-1,-1), 5),
+        ("TOPPADDING", (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ]))
+    story.append(table)
 
+
+def generate_pdf(lead):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.35*inch, bottomMargin=0.35*inch, leftMargin=0.45*inch, rightMargin=0.45*inch)
+    styles = getSampleStyleSheet()
+    normal = para_style(styles, "n", 9, 12)
+    bold = para_style(styles, "b", 9, 12, bold=True)
+    italic_bold = ParagraphStyle("ib", parent=normal, fontName="Helvetica-BoldOblique", fontSize=9, leading=12, spaceAfter=5)
+    small = para_style(styles, "s", 7.2, 9)
+
+    story = []
+    intro = [
+        ("Dorner Distributor,", normal),
+        ("Please find the following new RFQ and URGENT lead from Dorner CAD and process accordingly." if "Dorner CAD" in lead["CleanBody"] else "Please find the following new RFQ and URGENT lead from Dorner Config and process accordingly.", normal),
+        ("The pricing information has been submitted to the customer.", italic_bold),
+        ("Please contact the customer to review the application to ensure the proper equipment is quoted based upon the application requirements.", italic_bold),
+        ("If you have any questions, please let us know.", normal),
+        ("Best Regards,", normal),
+        ("Dorner Mfg. Corp.", normal),
+        ("CustomerService@Dorner.com", normal),
+        ("Tel: USA 800.397.8664   Global 262.367.7600", normal),
+    ]
+    for txt, sty in intro:
+        story.append(Paragraph(txt, sty))
+    story.append(Spacer(1, 0.12*inch))
+    story.append(Table([[""]], colWidths=[3.8*inch], rowHeights=[0.28*inch], style=TableStyle([("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#FF6600"))])))
+    add_rl_table(story, [["Distributor:", lead.get("Distributor", "")]], [1.05*inch, 2.75*inch])
+    story.append(Spacer(1, 0.25*inch))
+    story.append(Table([[""]], colWidths=[3.8*inch], rowHeights=[0.28*inch], style=TableStyle([("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#FF6600"))])))
+    add_rl_table(story, [
+        ["Customer Contact Info:", ""],
+        ["Name:", f"{lead.get('FirstName','')} {lead.get('LastName','')}"] ,
+        ["Title:", lead.get("ContactTitle", "")],
+        ["Industry:", lead.get("Industry", "")],
+        ["Company:", lead.get("Company", "")],
+        ["Phone:", lead.get("PhoneSupplied", "")],
+        ["Email:", lead.get("Email", "")],
+    ], [1.05*inch, 2.75*inch])
+    story.append(Spacer(1, 0.18*inch))
+    story.append(Table([[""]], colWidths=[4.0*inch], rowHeights=[0.28*inch], style=TableStyle([("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#FF6600"))])))
+    add_rl_table(story, [["Customer Contact Info:", ""], ["Address:", lead.get("FullAddress", "")]], [1.05*inch, 2.95*inch])
+    story.append(Spacer(1, 0.2*inch))
+    story.append(Table([[""]], colWidths=[7.0*inch], rowHeights=[0.28*inch], style=TableStyle([("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#FF6600"))])))
+    add_rl_table(story, [["Dorner Quote:", lead.get("Quote", ""), "Grand Total:", lead.get("GrandTotal", "")]], [1.2*inch, 2.0*inch, 1.2*inch, 2.6*inch])
+
+    body = lead["CleanBody"]
+    m = re.search(r"Grand Total:\s*\$?[\d,]+\.\d{2}\s*(.*?)\s*Qty\s+Part Number", body, flags=re.I | re.S)
+    title_block = normalize_text(m.group(1)) if m else ""
+    for line in title_block.splitlines():
+        story.append(Paragraph(line, bold))
+    product_rows = parse_product_rows(body)
+    pdata = [[Paragraph("Qty", bold), Paragraph("Part Number / Description", bold), Paragraph("Unit Price", bold)]]
+    for qty, part, desc, price in product_rows:
+        pdata.append([Paragraph(qty, small), Paragraph(f"<b>{part}</b><br/>{desc}", small), Paragraph(price.replace("ea.", "<br/>ea."), small)])
+    if product_rows:
+        t = Table(pdata, colWidths=[0.4*inch, 5.45*inch, 1.0*inch], repeatRows=1, hAlign="LEFT")
+        t.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"), ("FONTSIZE",(0,0),(-1,-1),7), ("TOPPADDING",(0,0),(-1,-1),5), ("BOTTOMPADDING",(0,0),(-1,-1),5)]))
+        story.append(t)
+
+    notes_match = re.search(r"Total Equipment Price:.*", body, flags=re.I | re.S)
+    if notes_match:
+        notes = notes_match.group(0)
+        for para in notes.split("\n"):
+            para = para.strip()
+            if para:
+                story.append(Paragraph(para, small if len(para) > 60 else bold))
+
+    SimpleDocTemplate(buf, pagesize=letter, topMargin=0.35*inch, bottomMargin=0.35*inch, leftMargin=0.45*inch, rightMargin=0.45*inch).build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def build_excel(lead):
+    data = {col: lead.get(col, "") for col in EXCEL_COLUMNS}
+    # include product if your template has it
+    data["Product"] = lead.get("Product", "")
+    df = pd.DataFrame([data])
     out = io.BytesIO()
-    wb.save(out)
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Leads")
+        ws = writer.book["Leads"]
+        for col_cells in ws.columns:
+            max_len = max(len(str(c.value or "")) for c in col_cells)
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 12), 45)
+        ws.column_dimensions["S"].width = 80
+        for cell in ws[1]:
+            cell.font = cell.font.copy(bold=True)
     out.seek(0)
     return out.getvalue()
 
 
-def process_one_file(uploaded_file, pasted_text=""):
-    msg_bytes = uploaded_file.getvalue() if uploaded_file else b""
-    original_name = uploaded_file.name if uploaded_file else "pasted_text.msg"
-    subject, body, msg_dt, error = parse_msg_bytes(msg_bytes, original_name) if msg_bytes else (DEFAULT_SUBJECT, "", None, None)
-    if pasted_text.strip():
-        body = normalize_text(pasted_text)
-    if not body:
-        raise ValueError(f"Could not read message body. Parser error: {error or 'unknown'}")
-    created_dt = extract_created_date(body, msg_dt)
-    base_name = filename_from_dt(created_dt)
-    record = build_lead_record(subject, body, created_dt, base_name)
-    return {
-        "base_name": base_name,
-        "subject": subject,
-        "body": body,
-        "msg_bytes": msg_bytes,
-        "record": record,
-        "pdf_bytes": make_pdf_bytes(subject, body),
-        "doc_bytes": make_docx_bytes(subject, body, base_name),
-        "parse_warning": error,
-    }
+def build_output_zip(uploaded_name, raw_msg, lead, docx_bytes, pdf_bytes, xlsx_bytes):
+    base = lead["FileBase"]
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"{base}.docx", docx_bytes)
+        z.writestr(f"{base}.pdf", pdf_bytes)
+        z.writestr(f"{base}.msg", raw_msg)
+        z.writestr("Dorner_Leads_Output.xlsx", xlsx_bytes)
+    out.seek(0)
+    return out.getvalue()
 
 
-def build_output_zip(processed_items):
-    records = [item["record"] for item in processed_items]
-    excel_bytes = append_records_to_workbook(records)
-    zbuf = io.BytesIO()
-    used_names = set()
-    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("Dorner_Leads_Output.xlsx", excel_bytes)
-        for item in processed_items:
-            base = item["base_name"]
-            if base in used_names:
-                suffix = 2
-                while f"{base}_{suffix}" in used_names:
-                    suffix += 1
-                base = f"{base}_{suffix}"
-            used_names.add(base)
-            z.writestr(f"{base}.pdf", item["pdf_bytes"])
-            z.writestr(f"{base}.docx", item["doc_bytes"])
-            z.writestr(f"{base}.msg", item["msg_bytes"] or item["body"].encode("utf-8"))
-    zbuf.seek(0)
-    return zbuf.getvalue()
+def main():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.title(APP_TITLE)
+    st.caption("Upload Dorner .msg or .txt lead. App creates styled DOCX, PDF, MSG copy and Excel output.")
+    uploaded = st.file_uploader("Upload Dorner lead file", type=["msg", "txt"])
+    if not uploaded:
+        st.info("Upload a Dorner lead message to start.")
+        return
+    raw, subject, created, body = read_uploaded_file(uploaded)
+    lead = parse_lead(subject, created, body)
+    st.success(f"Parsed lead: {lead.get('Company','')} / Quote {lead.get('Quote','')}")
+    st.write("File base name:", lead["FileBase"])
+    preview = {k: lead.get(k, "") for k in ["Brand", "Product", "Distributor", "FirstName", "LastName", "Company", "Email", "PhoneSupplied", "Quote", "GrandTotal", "LeadTime"]}
+    st.dataframe(pd.DataFrame([preview]))
 
+    docx_bytes = generate_docx(lead)
+    pdf_bytes = generate_pdf(lead)
+    xlsx_bytes = build_excel(lead)
+    zip_bytes = build_output_zip(uploaded.name, raw, lead, docx_bytes, pdf_bytes, xlsx_bytes)
 
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
-st.caption("Upload Dorner .msg leads, apply mapping rules, and download Excel + PDF/MSG/DOC files.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.download_button("Download DOCX", docx_bytes, file_name=f"{lead['FileBase']}.docx")
+    c2.download_button("Download PDF", pdf_bytes, file_name=f"{lead['FileBase']}.pdf")
+    c3.download_button("Download Excel", xlsx_bytes, file_name="Dorner_Leads_Output.xlsx")
+    c4.download_button("Download All ZIP", zip_bytes, file_name=f"{lead['FileBase']}_output.zip")
 
-with st.expander("Rules used by this app", expanded=False):
-    st.markdown("""
-- `LeadSource1` is always `Request For Quote`.
-- `Keyword` is the email subject line.
-- If body contains `Dorner CAD`, CAD lead comment is used; otherwise Config comment is used.
-- If Device contains `AquaGard` or `AquaPruf`: Brand = `Dorner`, Product = `AquaX`.
-- If Device contains `Garvey`: Brand = `Garvey`, Product = blank.
-- If Device contains `Montratec`: Brand = `Montratec`, Product = blank.
-- File names use `Dorner_YYYYMMDD_HHMMSS` from the `Created:` line when present.
-- PDF column contains `.pdf`, `.msg`, and `.docx` with the same base name. The DOCX is generated in the same plain email-body style as your sample Word document: no extra title/header, no subject/file-name block, and no visible tracking links.
-""")
+    with st.expander("Device text preview"):
+        st.text_area("Device", lead["device"], height=300)
 
-uploaded_files = st.file_uploader("Upload Dorner .msg file(s)", type=["msg"], accept_multiple_files=True)
-pasted_text = st.text_area("Optional: paste message body here if MSG parsing fails or for testing", height=260)
-
-if st.button("Process Lead(s)", type="primary"):
-    if not uploaded_files and not pasted_text.strip():
-        st.error("Please upload at least one .msg file or paste lead text.")
-    else:
-        items = []
-        errors = []
-        if uploaded_files:
-            for uf in uploaded_files:
-                try:
-                    items.append(process_one_file(uf, pasted_text if len(uploaded_files) == 1 else ""))
-                except Exception as exc:
-                    errors.append(f"{uf.name}: {exc}")
-        elif pasted_text.strip():
-            try:
-                items.append(process_one_file(None, pasted_text))
-            except Exception as exc:
-                errors.append(str(exc))
-
-        for e in errors:
-            st.error(e)
-
-        if items:
-            st.success(f"Processed {len(items)} lead(s).")
-            preview_rows = []
-            for item in items:
-                r = item["record"]
-                preview_rows.append({
-                    "FileBase": item["base_name"],
-                    "Brand": r.get("Brand"),
-                    "Product": r.get("Product"),
-                    "FirstName": r.get("FirstName"),
-                    "LastName": r.get("LastName"),
-                    "Company": r.get("Company"),
-                    "Email": r.get("Email"),
-                    "Phone": r.get("PhoneSupplied"),
-                    "Quote": r.get("DornerQuote"),
-                    "GrandTotal": r.get("GrandTotal"),
-                    "LeadSource1": r.get("LeadSource1"),
-                    "PDF Column": r.get("PDF"),
-                })
-                if item.get("parse_warning"):
-                    st.warning(f"Parser warning for {item['base_name']}: {item['parse_warning']}")
-            st.dataframe(preview_rows, use_container_width=True)
-            zip_bytes = build_output_zip(items)
-            st.download_button(
-                "Download Output ZIP",
-                data=zip_bytes,
-                file_name="dorner_processed_output.zip",
-                mime="application/zip",
-            )
+if __name__ == "__main__":
+    main()
