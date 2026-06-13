@@ -308,59 +308,84 @@ def make_pdf_bytes(title: str, body_text: str):
     return buffer.getvalue()
 
 
-def make_docx_bytes(title: str, body_text: str, base_name: str = ""):
-    """Create a clean Word document like the shared sample.
+def clean_text_for_doc(text: str) -> str:
+    """Prepare email text for DOCX/PDF output to match the user sample.
 
-    The DOCX keeps the full Dorner lead text, including long Device content,
-    CAD model details, quote/product lines, General Notes, Additional Spare
-    Parts, footer, and Created line. It does not summarize or truncate.
+    The sample Word file starts directly with the Dorner email body. It does not
+    include an added title, file name, subject line, or visible hyperlink URLs.
+    This cleaner keeps the full email/device content but removes noisy URL-only
+    lines and mailto/tracking links created by HTML-to-text extraction.
+    """
+    text = normalize_text(text)
+
+    # Remove visible URL targets that appear after linked words, for example:
+    # CustomerService@Dorner.com <mailto:...> or PDF <https://...>.
+    text = re.sub(r"\s*<mailto:[^>]+>", "", text, flags=re.I)
+    text = re.sub(r"\s*<https?://[^>]+>", "", text, flags=re.I)
+
+    cleaned_lines = []
+    skipping_wrapped_url = False
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        stripped = line.strip()
+
+        # Drop standalone or wrapped URL lines, including long SendGrid tracking URLs
+        # that may be split across several lines by Word/text extraction.
+        if skipping_wrapped_url:
+            if stripped.endswith(">"):
+                skipping_wrapped_url = False
+            continue
+        if re.match(r"^<https?://", stripped, flags=re.I):
+            if not stripped.endswith(">"):
+                skipping_wrapped_url = True
+            continue
+        if re.match(r"^https?://", stripped, flags=re.I):
+            continue
+
+        cleaned_lines.append(line)
+
+    text = "\n".join(cleaned_lines)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def make_docx_bytes(title: str, body_text: str, base_name: str = ""):
+    """Create DOCX in the same plain email-body style as the shared sample.
+
+    Important: do NOT add a custom heading, file name, subject, cover section,
+    hyperlink URLs, or summary. The document should start with "Dorner
+    Distributor," and then show the complete Dorner lead content through the
+    footer/Created line.
     """
     document = Document()
 
     section = document.sections[0]
-    section.top_margin = 457200      # 0.5 inch
-    section.bottom_margin = 457200
-    section.left_margin = 457200
-    section.right_margin = 457200
+    # Use Word-like margins and normal text so the generated document resembles
+    # the shared example instead of a report template.
+    section.top_margin = 914400      # 1 inch
+    section.bottom_margin = 914400
+    section.left_margin = 914400
+    section.right_margin = 914400
 
-    styles = document.styles
-    styles["Normal"].font.name = "Calibri"
-    styles["Normal"].font.size = Pt(10)
+    normal_style = document.styles["Normal"]
+    normal_style.font.name = "Calibri"
+    normal_style.font.size = Pt(11)
+    normal_style.paragraph_format.space_after = Pt(0)
+    normal_style.paragraph_format.line_spacing = 1.0
 
-    title_para = document.add_paragraph()
-    title_run = title_para.add_run("DORNER LEAD DOCUMENT")
-    title_run.bold = True
-    title_run.font.size = Pt(14)
+    doc_text = clean_text_for_doc(body_text)
 
-    if base_name:
-        p = document.add_paragraph()
-        p.add_run("File Name: ").bold = True
-        p.add_run(base_name)
-
-    if title:
-        p = document.add_paragraph()
-        p.add_run("Subject: ").bold = True
-        p.add_run(title)
-
-    document.add_paragraph("")
-
-    for raw_line in normalize_text(body_text).split("\n"):
+    for raw_line in doc_text.split("\n"):
         line = raw_line.rstrip()
-        if not line:
-            document.add_paragraph("")
-            continue
         p = document.add_paragraph()
-        run = p.add_run(line)
-        run.font.name = "Calibri"
-        run.font.size = Pt(10)
-
-        # Bold important section headings for readability while preserving text.
-        heading_labels = (
-            "Customer Contact Info:", "General Notes", "Additional spare parts",
-            "Dorner Quote:", "Grand Total:", "Distributor:", "Qty Part Number"
-        )
-        if any(line.lower().startswith(lbl.lower()) for lbl in heading_labels):
-            run.bold = True
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.line_spacing = 1.0
+        if line:
+            run = p.add_run(line)
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
 
     out = io.BytesIO()
     document.save(out)
@@ -461,7 +486,7 @@ with st.expander("Rules used by this app", expanded=False):
 - If Device contains `Garvey`: Brand = `Garvey`, Product = blank.
 - If Device contains `Montratec`: Brand = `Montratec`, Product = blank.
 - File names use `Dorner_YYYYMMDD_HHMMSS` from the `Created:` line when present.
-- PDF column contains `.pdf`, `.msg`, and `.docx` with the same base name. The DOCX is generated in the same clean full-lead style as your sample Word document.
+- PDF column contains `.pdf`, `.msg`, and `.docx` with the same base name. The DOCX is generated in the same plain email-body style as your sample Word document: no extra title/header, no subject/file-name block, and no visible tracking links.
 """)
 
 uploaded_files = st.file_uploader("Upload Dorner .msg file(s)", type=["msg"], accept_multiple_files=True)
