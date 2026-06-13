@@ -1,42 +1,39 @@
 # Dorner Lead Automation
 
-A simple Streamlit app to process Dorner `.msg` lead emails and append the mapped row to the Excel header/template.
+Clean Streamlit app for Dorner lead processing.
 
-## Files
+## Files in this ZIP
 
-- `app.py` - full Streamlit app and business logic
+- `app.py` - Streamlit application and all automation rules
 - `requirements.txt` - Python dependencies
-- `template.xlsx` - Excel template with your required headers
+- `template.xlsx` - Excel header/template used for output
+- `README.md` - setup notes
 
-## How to run locally
+## What it does
+
+1. Upload one or more Dorner `.msg` files.
+2. Extract lead/customer/quote information.
+3. Apply Dorner rules:
+   - LeadSource1 = Request For Quote
+   - Keyword = subject line
+   - Dorner CAD vs Config comment logic
+   - AquaGard/AquaPruf => Brand Dorner, Product AquaX
+   - Garvey => Brand Garvey, Product blank
+   - Montratec => Brand Montratec, Product blank
+4. The Device column keeps the full long lead section, including CAD files, quote details, General Notes, Additional Spare Parts, footer, and Created line where available.
+5. Generates three files with the same base filename from Created date/time:
+   - `Dorner_YYYYMMDD_HHMMSS.pdf`
+   - `Dorner_YYYYMMDD_HHMMSS.msg`
+   - `Dorner_YYYYMMDD_HHMMSS.docx`
+6. Creates an updated Excel output ZIP.
+
+## Run locally
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## How to deploy on Streamlit Cloud
+## Deploy on Streamlit Cloud
 
-1. Create a GitHub repository.
-2. Upload `app.py`, `requirements.txt`, and `template.xlsx` to the repository root.
-3. In Streamlit Cloud, choose the repo and set main file path to `app.py`.
-
-## What the app does
-
-- Upload one or more Dorner `.msg` emails.
-- Extract customer contact fields, quote, total, lead time, subject, date, and device text.
-- Apply Dorner rules:
-  - CAD vs Config comments.
-  - AquaGard/AquaPruf -> Brand Dorner and Product AquaX.
-  - Garvey -> Brand Garvey and Product blank.
-  - Montratec -> Brand Montratec and Product blank.
-  - LeadSource1 = Request For Quote.
-  - Keyword = email subject line.
-  - PDF column contains generated `.pdf`, `.msg`, and `.doc` names.
-- File names use `Dorner_YYYYMMDD_HHMMSS` from the message Created date when available.
-- Creates a ZIP containing generated PDF, MSG, DOC, and updated Excel workbook.
-
-## Notes
-
-- `.doc` output is HTML-based for Word compatibility.
-- If `.msg` parsing fails for a message, paste the lead text into the text box in the app and process from text.
+Upload these files directly to GitHub root, then select `app.py` as the Streamlit entry point.

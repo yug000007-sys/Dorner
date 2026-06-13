@@ -10,6 +10,7 @@ from html import escape
 import streamlit as st
 from bs4 import BeautifulSoup
 from docx import Document
+from docx.shared import Pt
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
 from reportlab.lib.pagesizes import letter
@@ -246,7 +247,7 @@ def build_lead_record(subject: str, body_text: str, created_dt: datetime, base_f
     else:
         lead_comment = CONFIG_COMMENT
 
-    pdf_col = f"{base_filename}.pdf, {base_filename}.msg, {base_filename}.doc"
+    pdf_col = f"{base_filename}.pdf, {base_filename}.msg, {base_filename}.docx"
     phone = field_after_label(text, "Phone")
 
     return {
@@ -307,11 +308,64 @@ def make_pdf_bytes(title: str, body_text: str):
     return buffer.getvalue()
 
 
-def make_doc_bytes(title: str, body_text: str):
-    # Word can open this HTML content even with .doc extension.
-    html = f"""<html><head><meta charset='utf-8'><title>{escape(title)}</title></head>
-<body><h1>{escape(title)}</h1><div>{safe_para(body_text)}</div></body></html>"""
-    return html.encode("utf-8")
+def make_docx_bytes(title: str, body_text: str, base_name: str = ""):
+    """Create a clean Word document like the shared sample.
+
+    The DOCX keeps the full Dorner lead text, including long Device content,
+    CAD model details, quote/product lines, General Notes, Additional Spare
+    Parts, footer, and Created line. It does not summarize or truncate.
+    """
+    document = Document()
+
+    section = document.sections[0]
+    section.top_margin = 457200      # 0.5 inch
+    section.bottom_margin = 457200
+    section.left_margin = 457200
+    section.right_margin = 457200
+
+    styles = document.styles
+    styles["Normal"].font.name = "Calibri"
+    styles["Normal"].font.size = Pt(10)
+
+    title_para = document.add_paragraph()
+    title_run = title_para.add_run("DORNER LEAD DOCUMENT")
+    title_run.bold = True
+    title_run.font.size = Pt(14)
+
+    if base_name:
+        p = document.add_paragraph()
+        p.add_run("File Name: ").bold = True
+        p.add_run(base_name)
+
+    if title:
+        p = document.add_paragraph()
+        p.add_run("Subject: ").bold = True
+        p.add_run(title)
+
+    document.add_paragraph("")
+
+    for raw_line in normalize_text(body_text).split("\n"):
+        line = raw_line.rstrip()
+        if not line:
+            document.add_paragraph("")
+            continue
+        p = document.add_paragraph()
+        run = p.add_run(line)
+        run.font.name = "Calibri"
+        run.font.size = Pt(10)
+
+        # Bold important section headings for readability while preserving text.
+        heading_labels = (
+            "Customer Contact Info:", "General Notes", "Additional spare parts",
+            "Dorner Quote:", "Grand Total:", "Distributor:", "Qty Part Number"
+        )
+        if any(line.lower().startswith(lbl.lower()) for lbl in heading_labels):
+            run.bold = True
+
+    out = io.BytesIO()
+    document.save(out)
+    out.seek(0)
+    return out.getvalue()
 
 
 def append_records_to_workbook(records):
@@ -367,7 +421,7 @@ def process_one_file(uploaded_file, pasted_text=""):
         "msg_bytes": msg_bytes,
         "record": record,
         "pdf_bytes": make_pdf_bytes(subject, body),
-        "doc_bytes": make_doc_bytes(subject, body),
+        "doc_bytes": make_docx_bytes(subject, body, base_name),
         "parse_warning": error,
     }
 
@@ -388,7 +442,7 @@ def build_output_zip(processed_items):
                 base = f"{base}_{suffix}"
             used_names.add(base)
             z.writestr(f"{base}.pdf", item["pdf_bytes"])
-            z.writestr(f"{base}.doc", item["doc_bytes"])
+            z.writestr(f"{base}.docx", item["doc_bytes"])
             z.writestr(f"{base}.msg", item["msg_bytes"] or item["body"].encode("utf-8"))
     zbuf.seek(0)
     return zbuf.getvalue()
@@ -407,7 +461,7 @@ with st.expander("Rules used by this app", expanded=False):
 - If Device contains `Garvey`: Brand = `Garvey`, Product = blank.
 - If Device contains `Montratec`: Brand = `Montratec`, Product = blank.
 - File names use `Dorner_YYYYMMDD_HHMMSS` from the `Created:` line when present.
-- PDF column contains `.pdf`, `.msg`, and `.doc` with the same base name.
+- PDF column contains `.pdf`, `.msg`, and `.docx` with the same base name. The DOCX is generated in the same clean full-lead style as your sample Word document.
 """)
 
 uploaded_files = st.file_uploader("Upload Dorner .msg file(s)", type=["msg"], accept_multiple_files=True)
