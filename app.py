@@ -309,42 +309,64 @@ def make_pdf_bytes(title: str, body_text: str):
 
 
 def clean_text_for_doc(text: str) -> str:
-    """Prepare email text for DOCX/PDF output to match the user sample.
+    """Return a Word-friendly plain Dorner email body.
 
-    The sample Word file starts directly with the Dorner email body. It does not
-    include an added title, file name, subject line, or visible hyperlink URLs.
-    This cleaner keeps the full email/device content but removes noisy URL-only
-    lines and mailto/tracking links created by HTML-to-text extraction.
+    This is intentionally NOT a report/summary. The DOCX must look like the
+    user's sample Word file: it starts directly with "Dorner Distributor," and
+    contains the original email body as clean plain text. It removes only noisy
+    HTML/link artifacts that appear in converted MSG files.
     """
     text = normalize_text(text)
 
-    # Remove visible URL targets that appear after linked words, for example:
-    # CustomerService@Dorner.com <mailto:...> or PDF <https://...>.
+    # Remove Outlook/HTML link targets while keeping the visible label text.
+    # Examples removed: <mailto:...>, <http://...>, <https://...>
     text = re.sub(r"\s*<mailto:[^>]+>", "", text, flags=re.I)
     text = re.sub(r"\s*<https?://[^>]+>", "", text, flags=re.I)
 
-    cleaned_lines = []
-    skipping_wrapped_url = False
+    # Remove raw URLs or wrapped tracking URLs on their own lines.
+    cleaned = []
+    skip_url_block = False
     for raw in text.split("\n"):
         line = raw.rstrip()
         stripped = line.strip()
 
-        # Drop standalone or wrapped URL lines, including long SendGrid tracking URLs
-        # that may be split across several lines by Word/text extraction.
-        if skipping_wrapped_url:
-            if stripped.endswith(">"):
-                skipping_wrapped_url = False
-            continue
-        if re.match(r"^<https?://", stripped, flags=re.I):
-            if not stripped.endswith(">"):
-                skipping_wrapped_url = True
-            continue
-        if re.match(r"^https?://", stripped, flags=re.I):
+        if skip_url_block:
+            if stripped.endswith(">") or stripped == "":
+                skip_url_block = False
             continue
 
-        cleaned_lines.append(line)
+        if re.match(r"^<?https?://", stripped, flags=re.I):
+            if stripped.startswith("<") and not stripped.endswith(">"):
+                skip_url_block = True
+            continue
 
-    text = "\n".join(cleaned_lines)
+        # Drop SendGrid/open tracking fragments that may be wrapped without a scheme.
+        if re.search(r"ct\.sendgrid\.net|/wf/open|upn=|u001\.", stripped, flags=re.I):
+            skip_url_block = True
+            continue
+
+        cleaned.append(line)
+
+    text = "\n".join(cleaned)
+
+    # Remove automation-added headings from older outputs if a generated doc is
+    # ever reprocessed. This prevents "DORNER LEAD DOCUMENT", File Name, Subject
+    # from appearing in the final DOCX.
+    lines = text.split("\n")
+    while lines and lines[0].strip() in {"DORNER LEAD DOCUMENT", ""}:
+        lines.pop(0)
+    while lines and re.match(r"^(File Name|Subject)\s*:", lines[0].strip(), flags=re.I):
+        lines.pop(0)
+    text = "\n".join(lines)
+
+    # Start exactly at Dorner Distributor when present, so no MSG header or app
+    # title appears above the lead body.
+    m = re.search(r"Dorner\s+Distributor\s*,", text, flags=re.I)
+    if m:
+        text = text[m.start():]
+
+    # Plain Word-friendly spacing.
+    text = text.replace("\u00a0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -352,46 +374,49 @@ def clean_text_for_doc(text: str) -> str:
 
 
 def make_docx_bytes(title: str, body_text: str, base_name: str = ""):
-    """Create DOCX in the same plain email-body style as the shared sample.
+    """Create the DOCX like the user's sample Word document.
 
-    Important: do NOT add a custom heading, file name, subject, cover section,
-    hyperlink URLs, or summary. The document should start with "Dorner
-    Distributor," and then show the complete Dorner lead content through the
-    footer/Created line.
+    Required output style:
+    - No title page
+    - No "DORNER LEAD DOCUMENT"
+    - No File Name / Subject block
+    - No visible URL/link target lines
+    - Starts directly with "Dorner Distributor,"
+    - Full email body remains, including quote, notes, spare parts, footer and Created line
     """
     document = Document()
 
     section = document.sections[0]
-    # Use Word-like margins and normal text so the generated document resembles
-    # the shared example instead of a report template.
-    section.top_margin = 914400      # 1 inch
-    section.bottom_margin = 914400
-    section.left_margin = 914400
-    section.right_margin = 914400
+    section.top_margin = 720000      # about 0.79 in, close and compact
+    section.bottom_margin = 720000
+    section.left_margin = 720000
+    section.right_margin = 720000
 
     normal_style = document.styles["Normal"]
     normal_style.font.name = "Calibri"
     normal_style.font.size = Pt(11)
+    normal_style.paragraph_format.space_before = Pt(0)
     normal_style.paragraph_format.space_after = Pt(0)
     normal_style.paragraph_format.line_spacing = 1.0
 
     doc_text = clean_text_for_doc(body_text)
 
+    # Add each original line as a paragraph. This matches the sample better than
+    # a single huge paragraph and keeps the document readable/searchable.
     for raw_line in doc_text.split("\n"):
         line = raw_line.rstrip()
         p = document.add_paragraph()
+        p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(0)
         p.paragraph_format.line_spacing = 1.0
-        if line:
-            run = p.add_run(line)
-            run.font.name = "Calibri"
-            run.font.size = Pt(11)
+        run = p.add_run(line if line else " ")
+        run.font.name = "Calibri"
+        run.font.size = Pt(11)
 
     out = io.BytesIO()
     document.save(out)
     out.seek(0)
     return out.getvalue()
-
 
 def append_records_to_workbook(records):
     if os.path.exists(TEMPLATE_FILE):
