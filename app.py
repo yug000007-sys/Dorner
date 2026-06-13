@@ -102,20 +102,47 @@ def read_uploaded_file(uploaded_file):
 
 
 def value_after(label: str, text: str, stop_labels=None):
-    """Extract value for a label only when the label begins a line.
-    This prevents matching the greeting line "Dorner Distributor," as Distributor.
+    """Extract a field value from Dorner body.
+
+    Handles both:
+      Distributor: Shaltz
+    and:
+      Distributor:\nShaltz
+
+    It only matches labels at the beginning of a line so it does not capture
+    the greeting line "Dorner Distributor,".
     """
     stop_labels = stop_labels or []
-    label_pat = re.escape(label)
-    pattern = rf"^\s*{label_pat}\s*:?\s*(.*?)"
+    lines = text.splitlines()
+    label_re = re.compile(rf"^\s*{re.escape(label)}\s*:\s*(.*)$", re.I)
+    stop_re = None
     if stop_labels:
-        stops = "|".join(map(re.escape, stop_labels))
-        pattern += rf"(?=\n\s*(?:{stops})\s*:|$)"
-    else:
-        pattern += r"(?:\n|$)"
-    m = re.search(pattern, text, flags=re.I | re.S | re.M)
-    return normalize_text(m.group(1)) if m else ""
+        stop_re = re.compile(rf"^\s*(?:{'|'.join(map(re.escape, stop_labels))})\s*:", re.I)
 
+    for i, line in enumerate(lines):
+        m = label_re.match(line)
+        if not m:
+            continue
+        value = m.group(1).strip()
+        collected = []
+        if value:
+            collected.append(value)
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j].strip()
+            if stop_re and stop_re.match(nxt):
+                break
+            # stop if another common label starts
+            if re.match(r"^(Name|Title|Industry|Company|Phone|Email|Address|Dorner Quote|CAD Models)\s*:", nxt, re.I):
+                break
+            if nxt:
+                collected.append(nxt)
+            # Distributor is one-line only; do not accidentally absorb the section header
+            if label.lower() == "distributor" and collected:
+                break
+            j += 1
+        return normalize_text("\n".join(collected))
+    return ""
 
 def parse_address(text: str):
     m = re.search(r"Address:\s*(.*?)(?=\n\s*\n|\n\s*Dorner Quote:|\n\s*CAD Models|$)", text, flags=re.I | re.S)
@@ -547,65 +574,120 @@ def generate_pdf(lead):
     return buf.getvalue()
 
 
-def build_excel(lead):
-    data = {col: lead.get(col, "") for col in EXCEL_COLUMNS}
-    # include product if your template has it
-    data["Product"] = lead.get("Product", "")
-    df = pd.DataFrame([data])
+def build_excel(leads):
+    if isinstance(leads, dict):
+        leads = [leads]
+    rows = []
+    for lead in leads:
+        data = {col: lead.get(col, "") for col in EXCEL_COLUMNS}
+        data["Product"] = lead.get("Product", "")
+        rows.append(data)
+    df = pd.DataFrame(rows)
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Leads")
         ws = writer.book["Leads"]
         for col_cells in ws.columns:
             max_len = max(len(str(c.value or "")) for c in col_cells)
-            ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 12), 45)
-        ws.column_dimensions["S"].width = 80
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 12), 60)
+        # Device column can be very long; keep it readable but not huge.
+        try:
+            device_col_idx = list(df.columns).index("device") + 1
+            from openpyxl.utils import get_column_letter
+            ws.column_dimensions[get_column_letter(device_col_idx)].width = 80
+        except Exception:
+            pass
         for cell in ws[1]:
             cell.font = cell.font.copy(bold=True)
     out.seek(0)
     return out.getvalue()
 
 
-def build_output_zip(uploaded_name, raw_msg, lead, docx_bytes, pdf_bytes, xlsx_bytes):
-    base = lead["FileBase"]
+def build_output_zip(results, xlsx_bytes):
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(f"{base}.docx", docx_bytes)
-        z.writestr(f"{base}.pdf", pdf_bytes)
-        z.writestr(f"{base}.msg", raw_msg)
+        for item in results:
+            lead = item["lead"]
+            base = lead["FileBase"]
+            z.writestr(f"{base}.docx", item["docx_bytes"])
+            z.writestr(f"{base}.pdf", item["pdf_bytes"])
+            z.writestr(f"{base}.msg", item["raw"])
         z.writestr("Dorner_Leads_Output.xlsx", xlsx_bytes)
     out.seek(0)
     return out.getvalue()
 
 
+def make_unique_file_bases(leads):
+    seen = {}
+    for lead in leads:
+        base = lead.get("FileBase", "Dorner_output")
+        if base not in seen:
+            seen[base] = 1
+            continue
+        seen[base] += 1
+        new_base = f"{base}_{seen[base]}"
+        lead["FileBase"] = new_base
+        lead["PDF"] = f"{new_base}.pdf, {new_base}.msg, {new_base}.docx"
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("Upload Dorner .msg or .txt lead. App creates styled DOCX, PDF, MSG copy and Excel output.")
-    uploaded = st.file_uploader("Upload Dorner lead file", type=["msg", "txt"])
-    if not uploaded:
-        st.info("Upload a Dorner lead message to start.")
+    st.caption("Upload one or many Dorner .msg/.txt leads. App creates styled DOCX, PDF, MSG copies and one Excel output with all rows.")
+
+    uploaded_files = st.file_uploader(
+        "Upload Dorner lead file(s)",
+        type=["msg", "txt"],
+        accept_multiple_files=True,
+    )
+    if not uploaded_files:
+        st.info("Upload one or more Dorner lead messages to start.")
         return
-    raw, subject, created, body = read_uploaded_file(uploaded)
-    lead = parse_lead(subject, created, body)
-    st.success(f"Parsed lead: {lead.get('Company','')} / Quote {lead.get('Quote','')}")
-    st.write("File base name:", lead["FileBase"])
-    preview = {k: lead.get(k, "") for k in ["Brand", "Product", "Distributor", "FirstName", "LastName", "Company", "Email", "PhoneSupplied", "Quote", "GrandTotal", "LeadTime"]}
-    st.dataframe(pd.DataFrame([preview]))
 
-    docx_bytes = generate_docx(lead)
-    pdf_bytes = generate_pdf(lead)
-    xlsx_bytes = build_excel(lead)
-    zip_bytes = build_output_zip(uploaded.name, raw, lead, docx_bytes, pdf_bytes, xlsx_bytes)
+    results = []
+    errors = []
+    for uploaded in uploaded_files:
+        try:
+            raw, subject, created, body = read_uploaded_file(uploaded)
+            lead = parse_lead(subject, created, body)
+            results.append({"uploaded_name": uploaded.name, "raw": raw, "lead": lead})
+        except Exception as exc:
+            errors.append(f"{uploaded.name}: {exc}")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("Download DOCX", docx_bytes, file_name=f"{lead['FileBase']}.docx")
-    c2.download_button("Download PDF", pdf_bytes, file_name=f"{lead['FileBase']}.pdf")
-    c3.download_button("Download Excel", xlsx_bytes, file_name="Dorner_Leads_Output.xlsx")
-    c4.download_button("Download All ZIP", zip_bytes, file_name=f"{lead['FileBase']}_output.zip")
+    if errors:
+        st.error("Some files could not be parsed:\n" + "\n".join(errors))
+    if not results:
+        return
 
-    with st.expander("Device text preview"):
-        st.text_area("Device", lead["device"], height=300)
+    leads = [item["lead"] for item in results]
+    make_unique_file_bases(leads)
+
+    # Generate files after unique base names are finalized.
+    for item in results:
+        lead = item["lead"]
+        item["docx_bytes"] = generate_docx(lead)
+        item["pdf_bytes"] = generate_pdf(lead)
+
+    xlsx_bytes = build_excel(leads)
+    zip_bytes = build_output_zip(results, xlsx_bytes)
+
+    st.success(f"Parsed {len(results)} lead(s). Excel will contain {len(results)} row(s).")
+
+    preview_cols = ["Brand", "Product", "Distributor", "FirstName", "LastName", "Company", "Email", "PhoneSupplied", "Quote", "GrandTotal", "LeadTime", "FileBase"]
+    st.dataframe(pd.DataFrame([{k: lead.get(k, "") for k in preview_cols} for lead in leads]), use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    c1.download_button("Download Excel (all rows)", xlsx_bytes, file_name="Dorner_Leads_Output.xlsx")
+    c2.download_button("Download All ZIP", zip_bytes, file_name="Dorner_All_Outputs.zip")
+
+    st.subheader("Individual downloads")
+    for item in results:
+        lead = item["lead"]
+        with st.expander(f"{lead.get('Company','')} / Quote {lead.get('Quote','')} / {lead.get('FileBase','')}"):
+            d1, d2, d3 = st.columns(3)
+            d1.download_button("Download DOCX", item["docx_bytes"], file_name=f"{lead['FileBase']}.docx", key=f"docx_{lead['FileBase']}")
+            d2.download_button("Download PDF", item["pdf_bytes"], file_name=f"{lead['FileBase']}.pdf", key=f"pdf_{lead['FileBase']}")
+            d3.download_button("Download MSG", item["raw"], file_name=f"{lead['FileBase']}.msg", key=f"msg_{lead['FileBase']}")
+            st.text_area("Device", lead.get("device", ""), height=220, key=f"device_{lead['FileBase']}")
 
 if __name__ == "__main__":
     main()
