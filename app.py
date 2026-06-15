@@ -1,7 +1,9 @@
 import io
 import re
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -125,19 +127,27 @@ def value_after(label: str, text: str, stop_labels=None):
             continue
         value = m.group(1).strip()
         collected = []
-        if value:
+        if value and not re.match(r"^(Customer Contact Info|Name|Title|Industry|Company|Phone|Email|Address|Dorner Quote|CAD Models)\s*:?", value, re.I):
             collected.append(value)
         j = i + 1
         while j < len(lines):
             nxt = lines[j].strip()
+            if not nxt:
+                j += 1
+                continue
             if stop_re and stop_re.match(nxt):
+                if label.lower() == "distributor" and not collected and re.match(r"^Customer Contact Info\s*:?", nxt, re.I):
+                    j += 1
+                    continue
                 break
             # stop if another common label starts
-            if re.match(r"^(Name|Title|Industry|Company|Phone|Email|Address|Dorner Quote|CAD Models)\s*:", nxt, re.I):
+            if re.match(r"^(Customer Contact Info|Name|Title|Industry|Company|Phone|Email|Address|Dorner Quote|CAD Models)\s*:", nxt, re.I):
+                if label.lower() == "distributor" and re.match(r"^Customer Contact Info\s*:", nxt, re.I):
+                    j += 1
+                    continue
                 break
-            if nxt:
-                collected.append(nxt)
-            # Distributor is one-line only; do not accidentally absorb the section header
+            collected.append(nxt)
+            # Distributor is one-line only; do not accidentally absorb the next section
             if label.lower() == "distributor" and collected:
                 break
             j += 1
@@ -167,22 +177,77 @@ def split_name(full_name: str):
     return parts[0], " ".join(parts[1:])
 
 
+EASTERN_TZ = ZoneInfo("America/New_York")
+
+
 def parse_created_dt(created: str):
+    """Parse the MSG/email timestamp and keep the original instant.
+
+    Dorner emails usually carry UTC timestamps such as:
+      Created: Wed 27 May 2026 05:54:16 PM UTC
+    The Excel ReceivedDateTime must show that instant in Eastern time,
+    e.g. 5/27/2026 1:54 PM.
+    """
+    cleaned = normalize_text(str(created or ""))
+    cleaned = re.sub(r"^Created:\s*", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"\s*\([^)]*\)\s*$", "", cleaned).strip()
+
+    if not cleaned:
+        return datetime.now(timezone.utc)
+
+    # Try RFC/email Date formats first.
+    try:
+        dt = parsedate_to_datetime(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        pass
+
+    # Common Dorner body format: Thu 28 May 2026 04:15:23 PM UTC
     candidates = [
         "%a %d %b %Y %I:%M:%S %p %Z",
+        "%a %d %B %Y %I:%M:%S %p %Z",
         "%a, %d %b %Y %H:%M:%S %z",
-        "%d %b %Y %H:%M:%S",
+        "%d %b %Y %H:%M:%S %z",
+        "%m/%d/%Y %I:%M %p",
+        "%m/%d/%Y %H:%M",
     ]
-    cleaned = created.replace("UTC", "UTC").strip()
     for fmt in candidates:
         try:
-            return datetime.strptime(cleaned, fmt)
+            dt = datetime.strptime(cleaned, fmt)
+            if dt.tzinfo is None:
+                # If the text says UTC/GMT, treat as UTC; otherwise keep as Eastern.
+                if re.search(r"\b(?:UTC|GMT)\b", cleaned, re.I):
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.replace(tzinfo=EASTERN_TZ)
+            return dt
         except Exception:
             pass
-    m = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\s+(20\d{2})\s+(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)?", cleaned)
+
+    # Last-resort parse for loose strings with AM/PM and optional UTC.
+    m = re.search(
+        r"(?:[A-Za-z]{3,9},?\s+)?(\d{1,2})\s+([A-Za-z]{3,9})\s+(20\d{2})\s+"
+        r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?\s*(UTC|GMT)?",
+        cleaned,
+        re.I,
+    )
     if m:
-        date_part = " ".join(m.groups(default="")[:3])
-    return datetime.utcnow()
+        day, mon, year, hh, mm, ss, ampm, zone = m.groups()
+        ss = ss or "00"
+        fmt = "%d %b %Y %I:%M:%S %p" if ampm else "%d %b %Y %H:%M:%S"
+        dt = datetime.strptime(f"{day} {mon[:3]} {year} {hh}:{mm}:{ss}" + (f" {ampm.upper()}" if ampm else ""), fmt)
+        dt = dt.replace(tzinfo=timezone.utc if zone else EASTERN_TZ)
+        return dt
+
+    return datetime.now(timezone.utc)
+
+
+def format_received_datetime(created: str):
+    dt = parse_created_dt(created).astimezone(EASTERN_TZ)
+    # Windows-safe/non-platform-specific m/d/yyyy h:mm AM/PM
+    return f"{dt.month}/{dt.day}/{dt.year} {dt.strftime('%I').lstrip('0')}:{dt.strftime('%M')} {dt.strftime('%p')}"
 
 
 def build_file_base(created: str):
@@ -238,7 +303,7 @@ def parse_lead(subject: str, created: str, body: str):
     return {
         "Brand": brand,
         "Product": product,
-        "ReceivedDateTime": created,
+        "ReceivedDateTime": format_received_datetime(created),
         "FirstName": first,
         "LastName": last,
         "ContactTitle": title,
