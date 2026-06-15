@@ -1,15 +1,24 @@
 # Dorner Lead Automation
 
-Upload one or many Dorner `.msg` or `.txt` lead files. The app creates:
+Clean flat Streamlit app.
 
-- One Excel output with all rows
-- Styled DOCX for each lead
-- PDF for each lead
-- MSG copy for each uploaded file
-- ZIP containing all outputs
+## Files
+- `app.py` - full app and rules
+- `requirements.txt` - Streamlit dependencies
+- `README.md` - setup
 
-Important fixes in this version:
+## Features
+- Upload multiple `.msg` files at once
+- Creates one Excel row per lead
+- Uses required header order
+- Adds `GrandTotal` as the final column
+- Extracts `GrandTotal` as text like `$14,370.00`
+- Extracts `ReceivedDateTime` from MSG/RFC Date header, fallback to `Created:` line
+- Creates same base filenames: `Dorner_YYYYMMDD_HHMMSS.pdf/.msg/.docx`
+- Generates styled DOCX/PDF attachments
+- Device field keeps full long lead section through `Created:`
 
-- Downloaded Excel uses the requested header order.
-- GrandTotal is included in the downloaded Excel and formatted as text like `$14,370.00`.
-- ReceivedDateTime is taken from the raw MSG/email Date header first, converted to Eastern time, and formatted like `5/27/2026 1:54 PM`.
+## Streamlit Cloud
+1. Upload these files to GitHub root.
+2. In Streamlit Cloud, set main file path to `app.py`.
+3. Deploy.
