@@ -648,6 +648,20 @@ def generate_pdf(lead):
     return buf.getvalue()
 
 
+def _money_to_number(value):
+    """Convert '$14,370.00' text into 14370.00 so Excel displays it reliably."""
+    if value is None:
+        return ""
+    txt = str(value).strip()
+    if not txt:
+        return ""
+    txt = txt.replace("$", "").replace(",", "").replace("ea.", "").strip()
+    try:
+        return float(txt)
+    except Exception:
+        return value
+
+
 def build_excel(leads):
     if isinstance(leads, dict):
         leads = [leads]
@@ -655,19 +669,46 @@ def build_excel(leads):
     for lead in leads:
         data = {col: lead.get(col, "") for col in EXCEL_COLUMNS}
         data["Product"] = lead.get("Product", "")
+        # Important: write GrandTotal as a real Excel currency number.
+        # Streamlit preview can show '$14,370.00' text, but downloaded XLSX needs
+        # numeric value + currency format so it is visible and usable in Excel.
+        if "GrandTotal" in data:
+            data["GrandTotal"] = _money_to_number(data["GrandTotal"])
         rows.append(data)
     df = pd.DataFrame(rows)
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Leads")
         ws = writer.book["Leads"]
+        from openpyxl.utils import get_column_letter
+
+        header_map = {cell.value: cell.column for cell in ws[1]}
+
+        # Format GrandTotal column properly in downloaded Excel.
+        if "GrandTotal" in header_map:
+            col_idx = header_map["GrandTotal"]
+            col_letter = get_column_letter(col_idx)
+            ws.column_dimensions[col_letter].width = 16
+            for row in range(2, ws.max_row + 1):
+                c = ws.cell(row=row, column=col_idx)
+                if c.value not in (None, ""):
+                    c.number_format = '$#,##0.00'
+
+        # Keep ReceivedDateTime readable.
+        if "ReceivedDateTime" in header_map:
+            ws.column_dimensions[get_column_letter(header_map["ReceivedDateTime"])].width = 22
+
         for col_cells in ws.columns:
+            col_name = col_cells[0].value
             max_len = max(len(str(c.value or "")) for c in col_cells)
-            ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 12), 60)
+            width = min(max(max_len + 2, 12), 60)
+            if col_name == "GrandTotal":
+                width = max(width, 16)
+            ws.column_dimensions[col_cells[0].column_letter].width = width
+
         # Device column can be very long; keep it readable but not huge.
         try:
             device_col_idx = list(df.columns).index("device") + 1
-            from openpyxl.utils import get_column_letter
             ws.column_dimensions[get_column_letter(device_col_idx)].width = 80
         except Exception:
             pass
