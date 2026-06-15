@@ -1,19 +1,15 @@
 # Dorner Lead Automation
 
-Streamlit app for Dorner lead automation.
+Upload one or many Dorner `.msg` or `.txt` lead files. The app creates:
 
-## Fix in this version
-- Fixes the DOCX generation crash caused by `.strip()` being applied to a tuple.
-- Fixes Distributor parsing so it uses the real `Distributor:` field and does not capture the greeting text.
-- Keeps the styled DOCX/PDF format with orange bars and blue information blocks.
+- One Excel output with all rows
+- Styled DOCX for each lead
+- PDF for each lead
+- MSG copy for each uploaded file
+- ZIP containing all outputs
 
-## Files
-- `app.py` - Streamlit app and all Dorner rules
-- `requirements.txt` - Python dependencies
-- `README.md` - setup notes
+Important fixes in this version:
 
-## Run locally
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+- Downloaded Excel uses the requested header order.
+- GrandTotal is included in the downloaded Excel and formatted as text like `$14,370.00`.
+- ReceivedDateTime is taken from the raw MSG/email Date header first, converted to Eastern time, and formatted like `5/27/2026 1:54 PM`.
