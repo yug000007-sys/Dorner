@@ -230,7 +230,7 @@ def build_lead(uploaded_file):
         except Exception:
             pass
     base_name = f"Dorner_{ts}"
-    pdf_names = f"{base_name}.pdf, {base_name}.msg, {base_name}.docx"
+    pdf_names = f"{base_name}.pdf, {base_name}.msg, {base_name}.doc"
     row = {h: "" for h in HEADERS}
     row.update({
         "Brand": brand,
@@ -354,6 +354,97 @@ def generate_docx(row, body, path):
     doc.save(path)
 
 
+def rtf_escape(text):
+    """Escape text for RTF while preserving readable Unicode where possible."""
+    if text is None:
+        return ""
+    out = []
+    for ch in str(text):
+        code = ord(ch)
+        if ch == "\\":
+            out.append(r"\\")
+        elif ch == "{":
+            out.append(r"\{")
+        elif ch == "}":
+            out.append(r"\}")
+        elif ch == "\n":
+            out.append(r"\par
+")
+        elif code > 127:
+            # RTF unicode escape. Word will display the correct character.
+            if code > 32767:
+                code -= 65536
+            out.append(rf"\u{code}?")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def rtf_par(text="", bold=False, font_size=18, color=1, before=0, after=40):
+    b1 = r"\b " if bold else ""
+    b2 = r"\b0 " if bold else ""
+    return rf"\pard\sa{after}\sb{before}\cf{color}\fs{font_size} {b1}{rtf_escape(text)}{b2}\par
+"
+
+
+def generate_rtf_doc(row, body, path):
+    """Create a Word-openable .doc file using RTF content.
+
+    This is the Streamlit Cloud compatible replacement for true binary .doc.
+    Microsoft Word opens it as a normal document even though the file extension is .doc.
+    """
+    intro_end = body.find("Distributor:")
+    intro = clean_text(body[:intro_end]) if intro_end > 0 else "Dorner Distributor,"
+
+    parts = []
+    parts.append(r"{\rtf1\ansi\deff0")
+    parts.append(r"{\fonttbl{\f0 Calibri;}}")
+    # color table: 1 black, 2 orange, 3 light blue, 4 white
+    parts.append(r"{\colortbl ;\red0\green0\blue0;\red244\green177\blue131;\red217\green234\blue247;\red255\green255\blue255;}")
+    parts.append(r"\paperw12240\paperh15840\margl792\margr792\margt648\margb648\f0\fs18 ")
+
+    # Email intro exactly at top, no filename/subject.
+    for line in intro.splitlines():
+        parts.append(rtf_par(line, font_size=18, after=20))
+
+    # Simple colored sections that Word can render reliably from RTF.
+    def section(title):
+        parts.append(rtf_par(title, bold=True, font_size=20, color=1, before=120, after=40))
+
+    def kv(label, value):
+        parts.append(rtf_par(f"{label}: {value or ''}", bold=False, font_size=18, after=20))
+
+    section("Distributor")
+    kv("Distributor", get_field(body, "Distributor"))
+
+    section("Customer Contact Info")
+    kv("Name", f"{row['FirstName']} {row['LastName']}".strip())
+    kv("Title", row["ContactTitle"])
+    kv("Industry", get_field(body, "Industry"))
+    kv("Company", row["Company"])
+    kv("Phone", row["PhoneSupplied"])
+    kv("Email", row["Email"])
+    kv("Address", row["Address"])
+    kv("City/State/Zip/Country", " ".join([row["City"], row["State"], row["ZipCode"], row["Country"]]).strip())
+
+    section("Quote Details")
+    quote = get_field(body, "Dorner Quote") or ""
+    if not quote:
+        qm = re.search(r"Dorner Quote:\s*([\d]+)", body, re.I)
+        quote = qm.group(1) if qm else ""
+    kv("Dorner Quote", quote)
+    kv("Grand Total", row.get("GrandTotal", ""))
+    kv("Lead Time", get_field(body, "Lead Time (Business Days)") or "")
+
+    section("Lead Details")
+    # Preserve full device text, including spare parts and created line, but cleaned of URLs.
+    for line in row["device"].splitlines():
+        parts.append(rtf_par(line, font_size=18, after=20))
+
+    parts.append("}")
+    Path(path).write_text("".join(parts), encoding="utf-8")
+
+
 def generate_pdf(row, body, path):
     styles = getSampleStyleSheet()
     normal = ParagraphStyle("normal9", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5, leading=10.5, alignment=TA_LEFT)
@@ -425,11 +516,10 @@ def process_files(files):
             row, base_name, subject, body, device, original_bytes = build_lead(f)
             rows.append(row)
             zf.writestr(f"{base_name}.msg", original_bytes)
-            with io.BytesIO() as docx_io:
-                tmp_doc = f"/tmp/{base_name}.docx"
-                generate_docx(row, body, tmp_doc)
-                with open(tmp_doc, "rb") as fh:
-                    zf.writestr(f"{base_name}.docx", fh.read())
+            tmp_doc = f"/tmp/{base_name}.doc"
+            generate_rtf_doc(row, body, tmp_doc)
+            with open(tmp_doc, "rb") as fh:
+                zf.writestr(f"{base_name}.doc", fh.read())
             tmp_pdf = f"/tmp/{base_name}.pdf"
             generate_pdf(row, body, tmp_pdf)
             with open(tmp_pdf, "rb") as fh:
@@ -442,7 +532,7 @@ def process_files(files):
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.write("Upload one or more Dorner .msg files. The app creates Excel rows plus styled DOCX/PDF/MSG attachments.")
+st.write("Upload one or more Dorner .msg files. The app creates Excel rows plus styled PDF/MSG/DOC attachments. The .doc file is RTF-based so it works on Streamlit Cloud and opens in Microsoft Word.")
 files = st.file_uploader("Upload MSG files", type=["msg", "eml", "txt"], accept_multiple_files=True)
 
 if files:
