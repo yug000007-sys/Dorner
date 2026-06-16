@@ -368,8 +368,7 @@ def rtf_escape(text):
         elif ch == "}":
             out.append(r"\}")
         elif ch == "\n":
-            out.append(r"\par
-")
+            out.append(r"\par")
         elif code > 127:
             # RTF unicode escape. Word will display the correct character.
             if code > 32767:
@@ -383,8 +382,7 @@ def rtf_escape(text):
 def rtf_par(text="", bold=False, font_size=18, color=1, before=0, after=40):
     b1 = r"\b " if bold else ""
     b2 = r"\b0 " if bold else ""
-    return rf"\pard\sa{after}\sb{before}\cf{color}\fs{font_size} {b1}{rtf_escape(text)}{b2}\par
-"
+    return rf"\pard\sa{after}\sb{before}\cf{color}\fs{font_size} {b1}{rtf_escape(text)}{b2}\par"
 
 
 def generate_rtf_doc(row, body, path):
