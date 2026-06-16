@@ -1,22 +1,16 @@
 # Dorner Lead Automation
 
-Streamlit app for Dorner lead MSG processing.
+Streamlit app for processing one or many Dorner `.msg` / `.txt` leads.
 
-## What it does
-- Upload one or more `.msg` files
-- Creates Excel rows using the required header order
-- Adds `GrandTotal` as the last Excel column
-- Generates attachments:
-  - `.pdf`
-  - `.msg`
-  - `.doc`
-- The `.doc` file is RTF-based and opens in Microsoft Word. This works on Streamlit Cloud without Microsoft Word installed.
+Outputs:
+- One Excel file with all rows
+- One `.pdf` per lead
+- One `.msg` copy per lead
+- One `.doc` per lead using Streamlit-compatible RTF content
+- One ZIP containing all generated files
 
-## Run locally
+Run:
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-## Deploy
-Upload these flat files to GitHub and deploy `app.py` on Streamlit Cloud.

@@ -1,6 +1,8 @@
 streamlit
 pandas
 openpyxl
-python-docx
-reportlab
 extract-msg
+beautifulsoup4
+lxml
+reportlab
+python-docx
