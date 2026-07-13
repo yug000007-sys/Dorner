@@ -69,7 +69,7 @@ def parse_msg_bytes(data: bytes, filename: str):
     tmp.write_bytes(data)
     subject = Path(filename).stem
     body = ""
-    raw_date = ""
+    raw_date = None
     sender = ""
 
     if extract_msg and filename.lower().endswith(".msg"):
@@ -77,7 +77,12 @@ def parse_msg_bytes(data: bytes, filename: str):
             msg = extract_msg.Message(str(tmp))
             subject = msg.subject or subject
             sender = msg.sender or ""
-            raw_date = str(getattr(msg, "date", "") or getattr(msg, "receivedTime", "") or "")
+            # Prefer the actual delivery/received timestamp over the "Date:" header
+            # (which reflects when the sender's client composed/sent the message).
+            # Both are real datetime objects from extract_msg, not strings -- keep
+            # them as datetimes so normalize_datetime doesn't have to re-parse a
+            # stringified ISO value with an RFC2822 parser (which silently fails).
+            raw_date = getattr(msg, "receivedTime", None) or getattr(msg, "date", None)
             body = msg.body or ""
             if not body and getattr(msg, "htmlBody", None):
                 body = html_to_text(msg.htmlBody)
@@ -105,7 +110,7 @@ def first_match(text, patterns, default=""):
     return default
 
 
-def normalize_datetime(raw_date: str, body: str) -> tuple[str, str]:
+def normalize_datetime(raw_date, body: str) -> tuple[str, str]:
     candidates = []
     if raw_date:
         candidates.append(raw_date)
@@ -114,22 +119,35 @@ def normalize_datetime(raw_date: str, body: str) -> tuple[str, str]:
         candidates.append(created)
 
     for c in candidates:
-        c = c.strip()
-        try:
-            dt = parsedate_to_datetime(c)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            et = dt.astimezone(EASTERN)
-            return et.strftime("%-m/%-d/%Y %-I:%M %p"), et.strftime("%Y%m%d_%H%M%S")
-        except Exception:
-            pass
-        for fmt in ["%a %d %b %Y %I:%M:%S %p %Z", "%a %d %b %Y %H:%M:%S %Z", "%m/%d/%Y %I:%M %p"]:
+        dt = None
+
+        # extract_msg's .date / .receivedTime are already real datetime objects --
+        # use them directly instead of stringifying and re-parsing (which fails
+        # silently since str(datetime) is ISO format, not RFC2822).
+        if isinstance(c, datetime):
+            dt = c
+        else:
+            c = str(c).strip()
             try:
-                dt = datetime.strptime(c.replace(" UTC", " GMT"), fmt.replace("UTC", "GMT"))
-                dt = dt.replace(tzinfo=timezone.utc).astimezone(EASTERN)
-                return dt.strftime("%-m/%-d/%Y %-I:%M %p"), dt.strftime("%Y%m%d_%H%M%S")
+                dt = parsedate_to_datetime(c)
             except Exception:
-                continue
+                dt = None
+            if dt is None:
+                for fmt in ["%a %d %b %Y %I:%M:%S %p %Z", "%a %d %b %Y %H:%M:%S %Z", "%m/%d/%Y %I:%M %p"]:
+                    try:
+                        dt = datetime.strptime(c.replace(" UTC", " GMT"), fmt.replace("UTC", "GMT"))
+                        break
+                    except Exception:
+                        continue
+
+        if dt is None:
+            continue
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        et = dt.astimezone(EASTERN)
+        return et.strftime("%-m/%-d/%Y %-I:%M %p"), et.strftime("%Y%m%d_%H%M%S")
+
     now = datetime.now(EASTERN)
     return now.strftime("%-m/%-d/%Y %-I:%M %p"), now.strftime("%Y%m%d_%H%M%S")
 
