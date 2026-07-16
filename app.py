@@ -275,12 +275,21 @@ def generate_rtf_doc(row: dict, path: Path):
         lab = r"\b " + rtf_escape(label) + r"\b0" if bold_label else rtf_escape(label)
         parts.append(r"\intbl " + lab + r"\cell " + rtf_escape(value) + r"\cell\row")
 
+    def header_row(label, width=5000):
+        # Single-cell full-width blue bar. NOTE: must NOT be built via blue_row()
+        # with matching width1==width2 -- \cellx values are cumulative right-edge
+        # boundaries, and two cells ending at the same boundary (e.g. cellx5000
+        # twice) is invalid RTF table geometry and is what Word flags as
+        # "a table in this document has become corrupted".
+        parts.append(r"\trowd\trgaph108\trleft0\clcbpat2\cellx" + str(width))
+        parts.append(r"\intbl \b " + rtf_escape(label) + r"\b0\cell\row")
+
     orange_bar(5000)
     blue_row("Distributor:", first_match(body, [r"Distributor:\s*([^\n]+)"]) or row.get("Referral", ""), 1700, 5000)
     parts.append(r"\par")
 
     orange_bar(5000)
-    blue_row("Customer Contact Info:", "", 5000, 5000)
+    header_row("Customer Contact Info:", 5000)
     blue_row("Name:", (row.get("FirstName", "") + " " + row.get("LastName", "")).strip(), 1700, 5000)
     blue_row("Title:", row.get("ContactTitle", ""), 1700, 5000)
     blue_row("Industry:", first_match(body, [r"Industry:\s*(.*?)(?:\nCompany:)"]), 1700, 5000)
@@ -290,7 +299,7 @@ def generate_rtf_doc(row: dict, path: Path):
     parts.append(r"\par")
 
     orange_bar(5000)
-    blue_row("Customer Contact Info:", "", 5000, 5000)
+    header_row("Customer Contact Info:", 5000)
     addr = "\n".join([x for x in [row.get("Address", ""), " ".join([row.get("City", ""), row.get("State", ""), row.get("ZipCode", ""), row.get("Country", "")]).strip()] if x])
     blue_row("Address:", addr, 1700, 5000)
     parts.append(r"\par")
