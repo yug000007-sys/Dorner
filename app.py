@@ -238,7 +238,7 @@ def parse_lead(subject: str, body: str, raw_date: str, original_filename: str):
     return row
 
 
-def rtf_escape(s: str) -> str:
+def rtf_escape(s: str, line_break: str = r"\par") -> str:
     if s is None:
         return ""
     out = []
@@ -247,7 +247,14 @@ def rtf_escape(s: str) -> str:
         if ch in ["\\", "{", "}"]:
             out.append("\\" + ch)
         elif ch == "\n":
-            out.append("\\par\n")
+            # \par is only safe for paragraphs OUTSIDE a table. Inside a table
+            # cell, \par without immediately reasserting \pard\intbl breaks the
+            # row's cell bookkeeping and desyncs everything after it -- Word then
+            # silently "repairs" the file by dropping content. Cell values with
+            # embedded newlines (e.g. multi-line addresses) must pass
+            # line_break=r"\line" instead, which is a soft break that stays in
+            # the same paragraph/cell.
+            out.append(line_break + "\n")
         elif code > 127:
             out.append(f"\\u{code}?")
         else:
@@ -273,7 +280,8 @@ def generate_rtf_doc(row: dict, path: Path):
     def blue_row(label, value, width1=1700, width2=6500, bold_label=True):
         parts.append(r"\trowd\trgaph108\trleft0\clcbpat2\cellx" + str(width1) + r"\clcbpat2\cellx" + str(width2))
         lab = r"\b " + rtf_escape(label) + r"\b0" if bold_label else rtf_escape(label)
-        parts.append(r"\intbl " + lab + r"\cell " + rtf_escape(value) + r"\cell\row")
+        # value may be multi-line (e.g. Address); use \line, not \par -- see rtf_escape note.
+        parts.append(r"\intbl " + lab + r"\cell " + rtf_escape(value, line_break=r"\line") + r"\cell\row")
 
     def header_row(label, width=5000):
         # Single-cell full-width blue bar. NOTE: must NOT be built via blue_row()
