@@ -271,7 +271,19 @@ def generate_rtf_doc(row: dict, path: Path):
     parts.append(r"{\colortbl;\red255\green102\blue0;\red198\green217\blue241;\red0\green76\blue128;}")
     parts.append(r"\paperw12240\paperh15840\margl720\margr720\margt720\margb720\fs22\f0")
 
-    intro = clean_text(header) or "Dorner Distributor,\nPlease find the following new RFQ and URGENT lead from Dorner CAD and process accordingly."
+    # header is always empty here: row["device"] was already truncated by
+    # extract_device() to start exactly at "Distributor:", so there is never any
+    # text before it to capture. That means intro always fell through to a
+    # hardcoded default -- and that default always said "Dorner CAD", even for
+    # Config leads. Reuse the CAD/Config detection already done correctly in
+    # parse_lead() (row["LeadComments"], derived from the full untruncated body)
+    # instead of re-deriving it from text that's no longer available here.
+    default_intro = (
+        "Dorner Distributor,\nPlease find the following new RFQ and URGENT lead from Dorner Config and process accordingly."
+        if row.get("LeadComments") == CONFIG_COMMENT
+        else "Dorner Distributor,\nPlease find the following new RFQ and URGENT lead from Dorner CAD and process accordingly."
+    )
+    intro = clean_text(header) or default_intro
     parts.append(rtf_escape(intro) + r"\par\par")
 
     def orange_bar(width=9000):
