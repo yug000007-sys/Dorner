@@ -19,6 +19,10 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from docx import Document
+from docx.shared import Pt, Inches
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 try:
     import extract_msg
@@ -199,14 +203,21 @@ def parse_lead(subject: str, body: str, raw_date: str, original_filename: str):
     dt_text, stamp = normalize_datetime(raw_date, body)
     file_base = f"Dorner_{stamp}"
     device = extract_device(body)
-    name = first_match(body, [r"Name:\s*([^\n]+)"])
+    # [ \t]* (not \s*) confines the match to the SAME line as the label. \s*
+    # includes \n, so when a field is genuinely blank in the source, a greedy
+    # \s* silently skips every blank line and captures the next section's
+    # header text instead (e.g. Distributor becomes "Customer Contact Info:").
+    # [^\n]* (not [^\n]+) lets a truly blank field match as empty right there,
+    # instead of failing to match and leaving the field to whatever the next
+    # occurrence of similar text happens to be.
+    name = first_match(body, [r"Name:[ \t]*([^\n]*)"])
     parts = name.split()
     first = parts[0] if parts else ""
     last = " ".join(parts[1:]) if len(parts) > 1 else ""
     street, city, state, zip_code, country = parse_address(body)
     brand, product = determine_brand_product(device)
     lead_comment = CAD_COMMENT if "Dorner CAD" in body else CONFIG_COMMENT if "Dorner Config" in body else ""
-    pdf_names = f"{file_base}.pdf, {file_base}.msg, {file_base}.doc"
+    pdf_names = f"{file_base}.pdf, {file_base}.msg, {file_base}.docx"
 
     row = {h: "" for h in HEADERS}
     row.update({
@@ -215,9 +226,9 @@ def parse_lead(subject: str, body: str, raw_date: str, original_filename: str):
         "ReceivedDateTime": dt_text,
         "FirstName": first,
         "LastName": last,
-        "ContactTitle": first_match(body, [r"Title:\s*([^\n]+)"]),
-        "Email": first_match(body, [r"Email:\s*([^\s\n]+)"]),
-        "Company": first_match(body, [r"Company:\s*([^\n]+)"]),
+        "ContactTitle": first_match(body, [r"Title:[ \t]*([^\n]*)"]),
+        "Email": first_match(body, [r"Email:[ \t]*([^\s\n]*)"]),
+        "Company": first_match(body, [r"Company:[ \t]*([^\n]*)"]),
         "Address": street,
         "City": city,
         "State": state,
@@ -225,7 +236,7 @@ def parse_lead(subject: str, body: str, raw_date: str, original_filename: str):
         "Country": country,
         "LeadSource1": "Request For Quote",
         "LeadComments": lead_comment,
-        "PhoneSupplied": first_match(body, [r"Phone:\s*([^\n]+)"]),
+        "PhoneSupplied": first_match(body, [r"Phone:[ \t]*([^\n]*)"]),
         "PDF": pdf_names,
         "Keyword": subject,
         "device": device,
@@ -238,113 +249,208 @@ def parse_lead(subject: str, body: str, raw_date: str, original_filename: str):
     return row
 
 
-def rtf_escape(s: str, line_break: str = r"\par") -> str:
-    if s is None:
-        return ""
-    out = []
-    for ch in str(s):
-        code = ord(ch)
-        if ch in ["\\", "{", "}"]:
-            out.append("\\" + ch)
-        elif ch == "\n":
-            # \par is only safe for paragraphs OUTSIDE a table. Inside a table
-            # cell, \par without immediately reasserting \pard\intbl breaks the
-            # row's cell bookkeeping and desyncs everything after it -- Word then
-            # silently "repairs" the file by dropping content. Cell values with
-            # embedded newlines (e.g. multi-line addresses) must pass
-            # line_break=r"\line" instead, which is a soft break that stays in
-            # the same paragraph/cell.
-            out.append(line_break + "\n")
-        elif code > 127:
-            out.append(f"\\u{code}?")
-        else:
-            out.append(ch)
-    return "".join(out)
+ORANGE_FILL = "FF6600"
+LIGHT_BLUE_FILL = "C6D9F1"
+
+# OOXML requires tblPr/tcPr children in a strict schema-defined sequence.
+# Blindly .append()-ing a new element (e.g. tblBorders after python-docx has
+# already added tblW/tblLayout/tblLook) produces a file that LibreOffice opens
+# without complaint but that fails XSD validation and Word can reject as
+# corrupt. Insert at the schema-correct position instead of appending.
+_TBLPR_ORDER = [
+    "tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize",
+    "tblStyleColBandSize", "tblW", "jc", "tblCellSpacing", "tblInd",
+    "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook", "tblCaption",
+    "tblDescription",
+]
+_TCPR_ORDER = [
+    "cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd",
+    "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign", "hideMark",
+]
 
 
-def generate_rtf_doc(row: dict, path: Path):
+def _insert_ordered(parent, new_el, order):
+    new_tag = qn_local(new_el.tag)
+    new_idx = order.index(new_tag) if new_tag in order else len(order)
+    for child in parent:
+        child_tag = qn_local(child.tag)
+        child_idx = order.index(child_tag) if child_tag in order else len(order)
+        if child_idx > new_idx:
+            child.addprevious(new_el)
+            return
+    parent.append(new_el)
+
+
+def qn_local(tag):
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _shade(tcPr, hex_color):
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_color)
+    _insert_ordered(tcPr, shd, _TCPR_ORDER)
+
+
+def _no_borders(table):
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "none")
+        el.set(qn("w:sz"), "0")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "auto")
+        borders.append(el)
+    _insert_ordered(table._tbl.tblPr, borders, _TBLPR_ORDER)
+
+
+def _fix_zoom(doc):
+    # python-docx's own default settings.xml emits <w:zoom w:val="bestFit"/>
+    # without the required w:percent attribute -- present even in a totally
+    # empty document with none of our content, so it's a library default, not
+    # something our table-building code causes. Still, patch it for a clean
+    # validation: Word tolerates it, but no reason to leave an avoidable
+    # schema violation in a file we're specifically trying to make bulletproof.
+    zoom = doc.settings.element.find(qn("w:zoom"))
+    if zoom is not None and zoom.get(qn("w:percent")) is None:
+        zoom.set(qn("w:percent"), "100")
+
+
+def _cell_text(cell, text, bold=False):
+    # Cell already has one empty paragraph by default; reuse it instead of
+    # leaving a stray blank paragraph before the real content.
+    p = cell.paragraphs[0]
+    lines = str(text).split("\n") if text else [""]
+    for i, line in enumerate(lines):
+        if i > 0:
+            p.add_run().add_break()  # soft line break, stays in the same cell/paragraph
+        run = p.add_run(line)
+        run.bold = bold
+
+
+def _orange_bar(doc, col_widths):
+    table = doc.add_table(rows=1, cols=len(col_widths))
+    table.autofit = False
+    _no_borders(table)
+    for c, w in zip(table.columns, col_widths):
+        c.width = Inches(w)
+    cell = table.cell(0, 0)
+    for i in range(1, len(col_widths)):
+        cell = cell.merge(table.cell(0, i))
+    _shade(cell._tc.get_or_add_tcPr(), ORANGE_FILL)
+    cell.paragraphs[0].add_run(" ").font.size = Pt(4)
+    return table
+
+
+def _header_bar(doc, label, col_widths):
+    table = doc.add_table(rows=1, cols=len(col_widths))
+    table.autofit = False
+    _no_borders(table)
+    for c, w in zip(table.columns, col_widths):
+        c.width = Inches(w)
+    cell = table.cell(0, 0)
+    for i in range(1, len(col_widths)):
+        cell = cell.merge(table.cell(0, i))
+    _shade(cell._tc.get_or_add_tcPr(), LIGHT_BLUE_FILL)
+    _cell_text(cell, label, bold=True)
+    return table
+
+
+def _label_value_table(doc, rows, col_widths):
+    table = doc.add_table(rows=len(rows), cols=len(col_widths))
+    table.autofit = False
+    _no_borders(table)
+    for c, w in zip(table.columns, col_widths):
+        c.width = Inches(w)
+    for r, cells in enumerate(rows):
+        for c, text in enumerate(cells):
+            cell = table.cell(r, c)
+            _shade(cell._tc.get_or_add_tcPr(), LIGHT_BLUE_FILL)
+            _cell_text(cell, text, bold=(c == 0))
+    return table
+
+
+def generate_docx(row: dict, path: Path):
     body = row.get("device", "")
-    header = body[:body.find("Distributor:")].strip() if "Distributor:" in body else ""
-    parts = []
-    parts.append(r"{\rtf1\ansi\deff0")
-    parts.append(r"{\fonttbl{\f0 Arial;}}")
-    parts.append(r"{\colortbl;\red255\green102\blue0;\red198\green217\blue241;\red0\green76\blue128;}")
-    parts.append(r"\paperw12240\paperh15840\margl720\margr720\margt720\margb720\fs22\f0")
 
-    # header is always empty here: row["device"] was already truncated by
-    # extract_device() to start exactly at "Distributor:", so there is never any
-    # text before it to capture. That means intro always fell through to a
-    # hardcoded default -- and that default always said "Dorner CAD", even for
-    # Config leads. Reuse the CAD/Config detection already done correctly in
-    # parse_lead() (row["LeadComments"], derived from the full untruncated body)
-    # instead of re-deriving it from text that's no longer available here.
-    default_intro = (
-        "Dorner Distributor,\nPlease find the following new RFQ and URGENT lead from Dorner Config and process accordingly."
+    # Reuse the CAD/Config detection already done correctly in parse_lead()
+    # (row["LeadComments"], derived from the full untruncated body) rather
+    # than re-deriving it from row["device"], which extract_device() already
+    # truncated to start exactly at "Distributor:".
+    intro_line2 = (
+        "Please find the following new RFQ and URGENT lead from Dorner Config and process accordingly."
         if row.get("LeadComments") == CONFIG_COMMENT
-        else "Dorner Distributor,\nPlease find the following new RFQ and URGENT lead from Dorner CAD and process accordingly."
+        else "Please find the following new RFQ and URGENT lead from Dorner CAD and process accordingly."
     )
-    intro = clean_text(header) or default_intro
-    parts.append(rtf_escape(intro) + r"\par\par")
 
-    def orange_bar(width=9000):
-        parts.append(r"\trowd\trgaph108\trleft0\clcbpat1\cellx" + str(width) + r" \intbl \cell\row")
+    doc = Document()
+    _fix_zoom(doc)
+    style = doc.styles["Normal"]
+    style.font.name = "Arial"
+    style.font.size = Pt(11)
 
-    def blue_row(label, value, width1=1700, width2=6500, bold_label=True):
-        parts.append(r"\trowd\trgaph108\trleft0\clcbpat2\cellx" + str(width1) + r"\clcbpat2\cellx" + str(width2))
-        lab = r"\b " + rtf_escape(label) + r"\b0" if bold_label else rtf_escape(label)
-        # value may be multi-line (e.g. Address); use \line, not \par -- see rtf_escape note.
-        parts.append(r"\intbl " + lab + r"\cell " + rtf_escape(value, line_break=r"\line") + r"\cell\row")
+    sec = doc.sections[0]
+    sec.page_width = Inches(8.5)
+    sec.page_height = Inches(11)
+    sec.left_margin = sec.right_margin = Inches(0.5)
+    sec.top_margin = sec.bottom_margin = Inches(0.5)
 
-    def header_row(label, width=5000):
-        # Single-cell full-width blue bar. NOTE: must NOT be built via blue_row()
-        # with matching width1==width2 -- \cellx values are cumulative right-edge
-        # boundaries, and two cells ending at the same boundary (e.g. cellx5000
-        # twice) is invalid RTF table geometry and is what Word flags as
-        # "a table in this document has become corrupted".
-        parts.append(r"\trowd\trgaph108\trleft0\clcbpat2\cellx" + str(width))
-        parts.append(r"\intbl \b " + rtf_escape(label) + r"\b0\cell\row")
+    doc.add_paragraph("Dorner Distributor,")
+    doc.add_paragraph(intro_line2)
+    doc.add_paragraph("")
 
-    orange_bar(5000)
-    blue_row("Distributor:", first_match(body, [r"Distributor:\s*([^\n]+)"]) or row.get("Referral", ""), 1700, 5000)
-    parts.append(r"\par")
+    LABEL_W, VALUE_W = 1.2, 2.27  # sums to ~3.47in, matching the original narrow left-side layout
 
-    orange_bar(5000)
-    header_row("Customer Contact Info:", 5000)
-    blue_row("Name:", (row.get("FirstName", "") + " " + row.get("LastName", "")).strip(), 1700, 5000)
-    blue_row("Title:", row.get("ContactTitle", ""), 1700, 5000)
-    blue_row("Industry:", first_match(body, [r"Industry:\s*(.*?)(?:\nCompany:)"]), 1700, 5000)
-    blue_row("Company:", row.get("Company", ""), 1700, 5000)
-    blue_row("Phone:", row.get("PhoneSupplied", ""), 1700, 5000)
-    blue_row("Email:", row.get("Email", ""), 1700, 5000)
-    parts.append(r"\par")
+    _orange_bar(doc, [LABEL_W, VALUE_W])
+    _label_value_table(doc, [["Distributor:", first_match(body, [r"Distributor:[ \t]*([^\n]*)"]) or row.get("Referral", "")]], [LABEL_W, VALUE_W])
+    doc.add_paragraph("")
 
-    orange_bar(5000)
-    header_row("Customer Contact Info:", 5000)
+    _orange_bar(doc, [LABEL_W, VALUE_W])
+    _header_bar(doc, "Customer Contact Info:", [LABEL_W, VALUE_W])
+    _label_value_table(doc, [
+        ["Name:", (row.get("FirstName", "") + " " + row.get("LastName", "")).strip()],
+        ["Title:", row.get("ContactTitle", "")],
+        ["Industry:", first_match(body, [r"Industry:\s*(.*?)(?:\nCompany:)"])],
+        ["Company:", row.get("Company", "")],
+        ["Phone:", row.get("PhoneSupplied", "")],
+        ["Email:", row.get("Email", "")],
+    ], [LABEL_W, VALUE_W])
+    doc.add_paragraph("")
+
+    _orange_bar(doc, [LABEL_W, VALUE_W])
+    _header_bar(doc, "Customer Contact Info:", [LABEL_W, VALUE_W])
     addr = "\n".join([x for x in [row.get("Address", ""), " ".join([row.get("City", ""), row.get("State", ""), row.get("ZipCode", ""), row.get("Country", "")]).strip()] if x])
-    blue_row("Address:", addr, 1700, 5000)
-    parts.append(r"\par")
+    _label_value_table(doc, [["Address:", addr]], [LABEL_W, VALUE_W])
+    doc.add_paragraph("")
 
-    orange_bar(9000)
-    parts.append(r"\trowd\trgaph108\trleft0\clcbpat2\cellx4500\clcbpat2\cellx7000\clcbpat2\cellx9000")
-    parts.append(r"\intbl \b Dorner Quote: \b0 " + rtf_escape(row.get("_quote", "")) + r"\cell \b Grand Total:\b0\cell \b\ul " + rtf_escape(row.get("GrandTotal", "")) + r"\ul0\b0\cell\row")
-    # \pard is required here, not just \par. A \row only ends the row -- it does
-    # NOT clear the \intbl (in-table) paragraph property carried by the cells.
-    # Without an explicit \pard, the parser never fully exits table mode, and
-    # everything typed afterward is ambiguous/ still-table-scoped content -- this
-    # is what actually corrupts the table and drops the rest of the document
-    # (confirmed by isolated repro: same table + \par + text truncates every
-    # time; the identical structure with \pard\par survives intact).
-    # Also guard \par's delimiting: it's followed by raw "Dorner Quote: ..." text
-    # (a letter), so it needs "\n" after it or it gets swallowed into an unknown
-    # control word "\parDorner".
-    parts.append(r"\pard\par" + "\n")
+    QTY_W = [1.5, 2.32, 2.5]  # sums to ~6.32in, matching the original wider quote/total row
+    _orange_bar(doc, QTY_W)
+    qtable = doc.add_table(rows=1, cols=3)
+    qtable.autofit = False
+    _no_borders(qtable)
+    for c, w in zip(qtable.columns, QTY_W):
+        c.width = Inches(w)
+    _shade(qtable.cell(0, 0)._tc.get_or_add_tcPr(), LIGHT_BLUE_FILL)
+    _shade(qtable.cell(0, 1)._tc.get_or_add_tcPr(), LIGHT_BLUE_FILL)
+    _shade(qtable.cell(0, 2)._tc.get_or_add_tcPr(), LIGHT_BLUE_FILL)
+    p0 = qtable.cell(0, 0).paragraphs[0]
+    p0.add_run("Dorner Quote: ").bold = True
+    p0.add_run(str(row.get("_quote", "")))
+    qtable.cell(0, 1).paragraphs[0].add_run("Grand Total:").bold = True
+    p2 = qtable.cell(0, 2).paragraphs[0]
+    r2 = p2.add_run(str(row.get("GrandTotal", "")))
+    r2.bold = True
+    r2.underline = True
+    doc.add_paragraph("")
 
-    # Add quote/product section as readable text, preserving content but after styled blocks.
+    # Plain quote/pricing/notes text, unstyled -- same content as before.
     qpos = body.find("Dorner Quote:")
     detail = body[qpos:] if qpos >= 0 else body
-    parts.append(rtf_escape(detail) + r"\par")
-    parts.append("}")
-    Path(path).write_text("".join(parts), encoding="utf-8")
+    for line in detail.split("\n"):
+        doc.add_paragraph(line)
+
+    doc.save(str(path))
 
 
 def generate_pdf(row: dict, path: Path):
@@ -438,12 +544,12 @@ def process_files(uploaded_files):
             rows.append(row)
             base = row["_file_base"]
             tmp_pdf = Path("/tmp") / f"{base}.pdf"
-            tmp_doc = Path("/tmp") / f"{base}.doc"
+            tmp_doc = Path("/tmp") / f"{base}.docx"
             generate_pdf(row, tmp_pdf)
-            generate_rtf_doc(row, tmp_doc)
+            generate_docx(row, tmp_doc)
             z.writestr(f"{base}.msg", data)
             z.write(tmp_pdf, f"{base}.pdf")
-            z.write(tmp_doc, f"{base}.doc")
+            z.write(tmp_doc, f"{base}.docx")
         excel_bytes = build_excel(rows)
         z.writestr("Dorner_Leads_Output.xlsx", excel_bytes)
     return rows, zip_buf.getvalue(), build_excel(rows)
@@ -451,7 +557,7 @@ def process_files(uploaded_files):
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Upload one or many Dorner .msg/.txt leads. App creates styled PDF, Streamlit-compatible .doc, MSG copies, and one Excel output with all rows.")
+st.caption("Upload one or many Dorner .msg/.txt leads. App creates styled PDF, native Word .docx, MSG copies, and one Excel output with all rows.")
 files = st.file_uploader("Upload Dorner lead file(s)", type=["msg", "txt", "eml"], accept_multiple_files=True)
 
 if files:
