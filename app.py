@@ -315,7 +315,17 @@ def generate_rtf_doc(row: dict, path: Path):
     orange_bar(9000)
     parts.append(r"\trowd\trgaph108\trleft0\clcbpat2\cellx4500\clcbpat2\cellx7000\clcbpat2\cellx9000")
     parts.append(r"\intbl \b Dorner Quote: \b0 " + rtf_escape(row.get("_quote", "")) + r"\cell \b Grand Total:\b0\cell \b\ul " + rtf_escape(row.get("GrandTotal", "")) + r"\ul0\b0\cell\row")
-    parts.append(r"\par")
+    # \pard is required here, not just \par. A \row only ends the row -- it does
+    # NOT clear the \intbl (in-table) paragraph property carried by the cells.
+    # Without an explicit \pard, the parser never fully exits table mode, and
+    # everything typed afterward is ambiguous/ still-table-scoped content -- this
+    # is what actually corrupts the table and drops the rest of the document
+    # (confirmed by isolated repro: same table + \par + text truncates every
+    # time; the identical structure with \pard\par survives intact).
+    # Also guard \par's delimiting: it's followed by raw "Dorner Quote: ..." text
+    # (a letter), so it needs "\n" after it or it gets swallowed into an unknown
+    # control word "\parDorner".
+    parts.append(r"\pard\par" + "\n")
 
     # Add quote/product section as readable text, preserving content but after styled blocks.
     qpos = body.find("Dorner Quote:")
